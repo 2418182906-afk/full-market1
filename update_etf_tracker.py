@@ -1000,6 +1000,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div id="broadMarketChart" style="height:460px;width:100%;"></div>
 
+      <!-- 新增：换算成“亿元”为单位的一模一样样式“沪深两市宽基 ETF 全系列份额汇总”图 -->
+      <div class="section-header" style="margin-top:20px;margin-bottom:12px;padding-bottom:10px;">
+        <div class="section-title-group">
+          <div class="section-title" style="font-size:15.5px;">
+            <span class="section-num">亿元换算</span>
+            沪深两市宽基 ETF 全系列份额汇总（亿元）
+          </div>
+          <div class="section-desc">换算口径：1 亿份 ≈ 1 亿元（单位：亿元），与上方“亿份”全系列份额汇总图样式保持一致</div>
+        </div>
+        <span class="rule-pill">按基金代码去重 · 单位：亿元</span>
+      </div>
+      <div id="broadMarketChartYiYuan" style="height:460px;width:100%;"></div>
+
       <div class="broad-table-wrap">
         <table class="broad-table">
           <thead>
@@ -1046,6 +1059,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="insight-strip" id="singleSeriesInsight"></div>
 
       <div id="singleSeriesChart" style="height:440px;width:100%;"></div>
+
+      <!-- 新增：换算成“亿元”为单位的一模一样样式“单系列 ETF 份额独立观测图” -->
+      <div class="section-header" style="margin-top:20px;margin-bottom:12px;padding-bottom:10px;">
+        <div class="section-title-group">
+          <div class="section-title" style="font-size:15.5px;">
+            <span class="section-num">亿元换算</span>
+            单系列 ETF 份额独立观测图（亿元）
+          </div>
+          <div class="section-desc">换算口径：1 亿份 ≈ 1 亿元（单位：亿元），与上方“亿份”单系列独立观测图样式保持一致</div>
+        </div>
+        <span class="rule-pill">单位：亿元</span>
+      </div>
+      <div id="singleSeriesChartYiYuan" style="height:440px;width:100%;"></div>
     </section>
 
     <!-- 8 Core Broad-Based ETF Snapshot Cards -->
@@ -1173,11 +1199,288 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return diff;
       }
 
+      function buildBroadMultiOption(bDates, groups, totalSeriesNorm, totalDiffNorm, unitText, tc) {
+        const fmt = (v) =>
+          v == null ? "—" : Number(v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const sign = (v) => (v == null ? "—" : (v > 0 ? "+" : "") + fmt(v));
+
+        const lineSeries = groups.map((g) => ({
+          name: g.name,
+          type: "line",
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          showSymbol: false,
+          smooth: false,
+          connectNulls: false,
+          data: normalizeToYi(g.series || []),
+          lineStyle: { width: 1.9, color: g.color || undefined },
+          itemStyle: { color: g.color || undefined },
+        }));
+
+        lineSeries.push({
+          name: "七大系列合计",
+          type: "line",
+          xAxisIndex: 0,
+          yAxisIndex: 0,
+          showSymbol: false,
+          smooth: false,
+          connectNulls: false,
+          data: totalSeriesNorm,
+          lineStyle: { width: 2.5, color: "#7c3aed" },
+          itemStyle: { color: "#7c3aed" },
+        });
+
+        lineSeries.push({
+          name: `七大系列合计每日份额变化(${unitText})`,
+          type: "bar",
+          xAxisIndex: 1,
+          yAxisIndex: 1,
+          data: totalDiffNorm,
+          itemStyle: {
+            color: function (p) {
+              if (p.value == null) return "transparent";
+              return p.value >= 0 ? "#ef4444" : "#22c55e";
+            },
+          },
+        });
+
+        return {
+          backgroundColor: "transparent",
+          tooltip: {
+            trigger: "axis",
+            axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }] },
+            backgroundColor: tc.tooltipBg,
+            borderColor: tc.axisLine,
+            textStyle: { color: tc.text, fontSize: 12 },
+            formatter: function (params) {
+              if (!params || !params.length) return "";
+              const idx = params[0].dataIndex;
+              const dt = bDates[idx];
+              const chg = totalDiffNorm[idx];
+              const chgColor = chg > 0 ? "#dc2626" : chg < 0 ? "#16a34a" : tc.text;
+              let html = `<div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">📅 ${dt}</div>`;
+              params.forEach((p) => {
+                if (p.value == null || p.seriesType === "bar") return;
+                html += `<div style="display:flex;justify-content:space-between;gap:16px;line-height:1.65;">
+                  <span>${p.marker} ${p.seriesName}</span>
+                  <strong style="font-family:monospace;">${fmt(p.value)} ${unitText}</strong>
+                </div>`;
+              });
+              html += `<div style="display:flex;justify-content:space-between;gap:16px;margin-top:4px;padding-top:4px;border-top:1px dashed ${tc.axisLine};line-height:1.65;">
+                <span>📊 七大系列合计每日变化</span>
+                <strong style="font-family:monospace;color:${chgColor};">${chg != null ? sign(chg) : "—"} ${unitText}</strong>
+              </div>`;
+              return html;
+            },
+          },
+          legend: {
+            top: 2,
+            left: "center",
+            type: "scroll",
+            textStyle: { color: tc.text, fontSize: 12 },
+          },
+          axisPointer: {
+            link: [{ xAxisIndex: "all" }],
+          },
+          grid: [
+            { left: 76, right: 28, top: 40, height: "48%" },
+            { left: 76, right: 28, top: "63%", height: "22%" },
+          ],
+          xAxis: [
+            {
+              type: "category",
+              data: bDates,
+              gridIndex: 0,
+              boundaryGap: false,
+              axisLine: { lineStyle: { color: tc.axisLine } },
+              axisLabel: { show: false },
+              axisTick: { show: false },
+              splitLine: { show: true, lineStyle: { color: tc.gridLine } },
+            },
+            {
+              type: "category",
+              data: bDates,
+              gridIndex: 1,
+              boundaryGap: true,
+              axisLine: { lineStyle: { color: tc.axisLine } },
+              axisLabel: { color: tc.subText, fontSize: 11, hideOverlap: true },
+              splitLine: { show: true, lineStyle: { color: tc.gridLine } },
+            },
+          ],
+          yAxis: [
+            {
+              type: "value",
+              name: unitText,
+              gridIndex: 0,
+              scale: true,
+              nameTextStyle: { color: tc.subText, fontSize: 11.5 },
+              axisLabel: { color: tc.subText, fontSize: 11 },
+              splitLine: { lineStyle: { color: tc.gridLine } },
+            },
+            {
+              type: "value",
+              name: `日变化(${unitText})`,
+              gridIndex: 1,
+              nameTextStyle: { color: tc.subText, fontSize: 11 },
+              axisLabel: { color: tc.subText, fontSize: 10.5 },
+              splitLine: { lineStyle: { color: tc.gridLine } },
+            },
+          ],
+          dataZoom: [
+            { type: "inside", xAxisIndex: [0, 1], start: 0, end: 100 },
+            {
+              type: "slider",
+              xAxisIndex: [0, 1],
+              bottom: 4,
+              height: 22,
+              start: 0,
+              end: 100,
+              borderColor: tc.axisLine,
+              textStyle: { color: tc.subText },
+            },
+          ],
+          series: lineSeries,
+        };
+      }
+
+      function buildSingleSeriesChartOption(bDates, seriesNorm, diffNorm, grpName, seriesColor, zoomStart, zoomEnd, unitText, tc) {
+        const fmt = (v) =>
+          v == null ? "—" : Number(v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const sign = (v) => (v == null ? "—" : (v > 0 ? "+" : "") + fmt(v));
+
+        return {
+          backgroundColor: "transparent",
+          tooltip: {
+            trigger: "axis",
+            axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }] },
+            backgroundColor: tc.tooltipBg,
+            borderColor: tc.axisLine,
+            textStyle: { color: tc.text, fontSize: 12 },
+            formatter: function (params) {
+              if (!params || !params.length) return "";
+              const idx = params[0].dataIndex;
+              const dt = bDates[idx];
+              const sh = seriesNorm[idx];
+              const chg = diffNorm[idx];
+              const chgColor = chg > 0 ? "#dc2626" : chg < 0 ? "#16a34a" : tc.text;
+              return `
+                <div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">
+                  📅 ${dt} · ${grpName}
+                </div>
+                <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
+                  <span>🏦 系列总份额：</span>
+                  <strong style="font-family:monospace;">${sh != null ? fmt(sh) : "—"} ${unitText}</strong>
+                </div>
+                <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
+                  <span>📊 较前日变化：</span>
+                  <strong style="font-family:monospace;color:${chgColor};">${chg != null ? sign(chg) : "—"} ${unitText}</strong>
+                </div>
+              `;
+            },
+          },
+          legend: {
+            top: 2,
+            left: "center",
+            textStyle: { color: tc.text, fontSize: 12 },
+          },
+          axisPointer: {
+            link: [{ xAxisIndex: "all" }],
+          },
+          grid: [
+            { left: 76, right: 28, top: 38, height: "46%" },
+            { left: 76, right: 28, top: "60%", height: "23%" },
+          ],
+          xAxis: [
+            {
+              type: "category",
+              data: bDates,
+              gridIndex: 0,
+              boundaryGap: false,
+              axisLine: { lineStyle: { color: tc.axisLine } },
+              axisLabel: { show: false },
+              axisTick: { show: false },
+              splitLine: { show: true, lineStyle: { color: tc.gridLine } },
+            },
+            {
+              type: "category",
+              data: bDates,
+              gridIndex: 1,
+              boundaryGap: true,
+              axisLine: { lineStyle: { color: tc.axisLine } },
+              axisLabel: { color: tc.subText, fontSize: 11, hideOverlap: true },
+              splitLine: { show: true, lineStyle: { color: tc.gridLine } },
+            },
+          ],
+          yAxis: [
+            {
+              type: "value",
+              name: `总份额(${unitText})`,
+              gridIndex: 0,
+              scale: true,
+              nameTextStyle: { color: tc.subText, fontSize: 11.5 },
+              axisLabel: { color: tc.subText, fontSize: 11 },
+              splitLine: { lineStyle: { color: tc.gridLine } },
+            },
+            {
+              type: "value",
+              name: `日变化(${unitText})`,
+              gridIndex: 1,
+              nameTextStyle: { color: tc.subText, fontSize: 11 },
+              axisLabel: { color: tc.subText, fontSize: 10.5 },
+              splitLine: { lineStyle: { color: tc.gridLine } },
+            },
+          ],
+          dataZoom: [
+            { type: "inside", xAxisIndex: [0, 1], start: zoomStart, end: zoomEnd },
+            {
+              type: "slider",
+              xAxisIndex: [0, 1],
+              bottom: 4,
+              height: 22,
+              start: zoomStart,
+              end: zoomEnd,
+              borderColor: tc.axisLine,
+              textStyle: { color: tc.subText },
+            },
+          ],
+          series: [
+            {
+              name: `${grpName}总份额(${unitText})`,
+              type: "line",
+              xAxisIndex: 0,
+              yAxisIndex: 0,
+              showSymbol: false,
+              smooth: false,
+              connectNulls: false,
+              data: seriesNorm,
+              lineStyle: { width: 2.4, color: seriesColor },
+              itemStyle: { color: seriesColor },
+              areaStyle: { color: seriesColor, opacity: 0.08 },
+            },
+            {
+              name: `${grpName}每日份额变化(${unitText})`,
+              type: "bar",
+              xAxisIndex: 1,
+              yAxisIndex: 1,
+              data: diffNorm,
+              itemStyle: {
+                color: function (p) {
+                  if (p.value == null) return "transparent";
+                  return p.value >= 0 ? "#ef4444" : "#22c55e";
+                },
+              },
+            },
+          ],
+        };
+      }
+
       // =========================================================================
-      // 1. 原来的“沪深两市宽基 ETF 全系列份额汇总”图（多线对比 + 每日份额变化）
+      // 1. 原来的“沪深两市宽基 ETF 全系列份额汇总”图 + 新增“亿元”换算同款图
       // =========================================================================
       let broadChartInstance = null;
+      let broadChartYiYuanInstance = null;
       let singleSeriesChartInstance = null;
+      let singleSeriesChartYiYuanInstance = null;
       let selectedSingleSeriesId = null;
       let singleSeriesZoomStart = 0;
       let singleSeriesZoomEnd = 100;
@@ -1220,155 +1523,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         `;
 
         const totalDom = document.getElementById("broadMarketChart");
+        const totalYiYuanDom = document.getElementById("broadMarketChartYiYuan");
         const tc = getThemeColors();
 
-        if (window.echarts && totalDom && bDates.length) {
-          if (!broadChartInstance) {
-            broadChartInstance = echarts.init(totalDom);
+        if (window.echarts && bDates.length) {
+          if (totalDom) {
+            if (!broadChartInstance) {
+              broadChartInstance = echarts.init(totalDom);
+            }
+            broadChartInstance.setOption(
+              buildBroadMultiOption(bDates, groups, totalSeriesNorm, totalDiffNorm, "亿份", tc),
+              true
+            );
           }
 
-          const lineSeries = groups.map((g) => ({
-            name: g.name,
-            type: "line",
-            xAxisIndex: 0,
-            yAxisIndex: 0,
-            showSymbol: false,
-            smooth: false,
-            connectNulls: false,
-            data: normalizeToYi(g.series || []),
-            lineStyle: { width: 1.9, color: g.color || undefined },
-            itemStyle: { color: g.color || undefined },
-          }));
-
-          lineSeries.push({
-            name: "七大系列合计",
-            type: "line",
-            xAxisIndex: 0,
-            yAxisIndex: 0,
-            showSymbol: false,
-            smooth: false,
-            connectNulls: false,
-            data: totalSeriesNorm,
-            lineStyle: { width: 2.5, color: "#7c3aed" },
-            itemStyle: { color: "#7c3aed" },
-          });
-
-          lineSeries.push({
-            name: "七大系列合计每日份额变化",
-            type: "bar",
-            xAxisIndex: 1,
-            yAxisIndex: 1,
-            data: totalDiffNorm,
-            itemStyle: {
-              color: function (p) {
-                if (p.value == null) return "transparent";
-                return p.value >= 0 ? "#ef4444" : "#22c55e";
-              },
-            },
-          });
-
-          const option = {
-            backgroundColor: "transparent",
-            tooltip: {
-              trigger: "axis",
-              axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }] },
-              backgroundColor: tc.tooltipBg,
-              borderColor: tc.axisLine,
-              textStyle: { color: tc.text, fontSize: 12 },
-              formatter: function (params) {
-                if (!params || !params.length) return "";
-                const idx = params[0].dataIndex;
-                const dt = bDates[idx];
-                const chg = totalDiffNorm[idx];
-                const chgColor = chg > 0 ? "#dc2626" : chg < 0 ? "#16a34a" : tc.text;
-                let html = `<div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">📅 ${dt}</div>`;
-                params.forEach((p) => {
-                  if (p.value == null || p.seriesType === "bar") return;
-                  html += `<div style="display:flex;justify-content:space-between;gap:16px;line-height:1.65;">
-                    <span>${p.marker} ${p.seriesName}</span>
-                    <strong style="font-family:monospace;">${fmt(p.value)} 亿份</strong>
-                  </div>`;
-                });
-                html += `<div style="display:flex;justify-content:space-between;gap:16px;margin-top:4px;padding-top:4px;border-top:1px dashed ${tc.axisLine};line-height:1.65;">
-                  <span>📊 七大系列合计每日变化</span>
-                  <strong style="font-family:monospace;color:${chgColor};">${chg != null ? sign(chg) : "—"} 亿份</strong>
-                </div>`;
-                return html;
-              },
-            },
-            legend: {
-              top: 2,
-              left: "center",
-              type: "scroll",
-              textStyle: { color: tc.text, fontSize: 12 },
-            },
-            axisPointer: {
-              link: [{ xAxisIndex: "all" }],
-            },
-            grid: [
-              { left: 76, right: 28, top: 40, height: "48%" },
-              { left: 76, right: 28, top: "63%", height: "22%" },
-            ],
-            xAxis: [
-              {
-                type: "category",
-                data: bDates,
-                gridIndex: 0,
-                boundaryGap: false,
-                axisLine: { lineStyle: { color: tc.axisLine } },
-                axisLabel: { show: false },
-                axisTick: { show: false },
-                splitLine: { show: true, lineStyle: { color: tc.gridLine } },
-              },
-              {
-                type: "category",
-                data: bDates,
-                gridIndex: 1,
-                boundaryGap: true,
-                axisLine: { lineStyle: { color: tc.axisLine } },
-                axisLabel: { color: tc.subText, fontSize: 11, hideOverlap: true },
-                splitLine: { show: true, lineStyle: { color: tc.gridLine } },
-              },
-            ],
-            yAxis: [
-              {
-                type: "value",
-                name: "亿份",
-                gridIndex: 0,
-                scale: true,
-                nameTextStyle: { color: tc.subText, fontSize: 11.5 },
-                axisLabel: { color: tc.subText, fontSize: 11 },
-                splitLine: { lineStyle: { color: tc.gridLine } },
-              },
-              {
-                type: "value",
-                name: "日变化(亿份)",
-                gridIndex: 1,
-                nameTextStyle: { color: tc.subText, fontSize: 11 },
-                axisLabel: { color: tc.subText, fontSize: 10.5 },
-                splitLine: { lineStyle: { color: tc.gridLine } },
-              },
-            ],
-            dataZoom: [
-              { type: "inside", xAxisIndex: [0, 1], start: 0, end: 100 },
-              {
-                type: "slider",
-                xAxisIndex: [0, 1],
-                bottom: 4,
-                height: 22,
-                start: 0,
-                end: 100,
-                borderColor: tc.axisLine,
-                textStyle: { color: tc.subText },
-              },
-            ],
-            series: lineSeries,
-          };
-
-          broadChartInstance.setOption(option, true);
-        } else if (totalDom) {
-          totalDom.innerHTML =
-            '<div style="padding:40px;text-align:center;color:var(--text-muted)">等待首次全市场数据采集</div>';
+          if (totalYiYuanDom) {
+            if (!broadChartYiYuanInstance) {
+              broadChartYiYuanInstance = echarts.init(totalYiYuanDom);
+            }
+            broadChartYiYuanInstance.setOption(
+              buildBroadMultiOption(bDates, groups, totalSeriesNorm, totalDiffNorm, "亿元", tc),
+              true
+            );
+          }
+        } else {
+          if (totalDom) {
+            totalDom.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">等待首次全市场数据采集</div>';
+          }
+          if (totalYiYuanDom) {
+            totalYiYuanDom.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">等待首次全市场数据采集</div>';
+          }
         }
 
         if (!selectedSingleSeriesId && groups.length) {
@@ -1451,7 +1635,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
 
       // =========================================================================
-      // 2. 新增的独立系列图板块（单系列 ETF 份额独立观测图）
+      // 2. 新增的独立系列图板块 + 新增“亿元”换算同款图
       // =========================================================================
       function renderSingleSeriesSection() {
         const B = DATA.broad_market || {};
@@ -1522,154 +1706,86 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
           <div class="insight-item">
             <span class="insight-label">最新系列总份额（${latestDate}）</span>
-            <span class="insight-val">${fmt(latestVal)} 亿份</span>
+            <span class="insight-val">${fmt(latestVal)} 亿份（${fmt(latestVal)} 亿元）</span>
           </div>
           <div class="insight-item">
             <span class="insight-label">较前一有效披露日变化</span>
-            <span class="insight-val" style="color:${latestChg > 0 ? "var(--up-red)" : latestChg < 0 ? "var(--down-green)" : "inherit"}">${sign(latestChg)} 亿份</span>
+            <span class="insight-val" style="color:${latestChg > 0 ? "var(--up-red)" : latestChg < 0 ? "var(--down-green)" : "inherit"}">${sign(latestChg)} 亿份（${sign(latestChg)} 亿元）</span>
           </div>
         `;
 
         const singleDom = document.getElementById("singleSeriesChart");
+        const singleYiYuanDom = document.getElementById("singleSeriesChartYiYuan");
         const tc = getThemeColors();
-        if (window.echarts && singleDom && bDates.length) {
-          if (!singleSeriesChartInstance) {
-            singleSeriesChartInstance = echarts.init(singleDom);
-            singleSeriesChartInstance.on("datazoom", function () {
-              const opt = singleSeriesChartInstance.getOption();
-              if (opt.dataZoom && opt.dataZoom[0]) {
-                singleSeriesZoomStart = opt.dataZoom[0].start;
-                singleSeriesZoomEnd = opt.dataZoom[0].end;
-              }
-            });
+
+        if (window.echarts && bDates.length) {
+          if (singleDom) {
+            if (!singleSeriesChartInstance) {
+              singleSeriesChartInstance = echarts.init(singleDom);
+              singleSeriesChartInstance.on("datazoom", function () {
+                const opt = singleSeriesChartInstance.getOption();
+                if (opt.dataZoom && opt.dataZoom[0]) {
+                  singleSeriesZoomStart = opt.dataZoom[0].start;
+                  singleSeriesZoomEnd = opt.dataZoom[0].end;
+                  if (singleSeriesChartYiYuanInstance) {
+                    singleSeriesChartYiYuanInstance.dispatchAction({
+                      type: "dataZoom",
+                      start: singleSeriesZoomStart,
+                      end: singleSeriesZoomEnd,
+                    });
+                  }
+                }
+              });
+            }
+            singleSeriesChartInstance.setOption(
+              buildSingleSeriesChartOption(
+                bDates,
+                seriesNorm,
+                diffNorm,
+                grp.name,
+                seriesColor,
+                singleSeriesZoomStart,
+                singleSeriesZoomEnd,
+                "亿份",
+                tc
+              ),
+              true
+            );
           }
 
-          const option = {
-            backgroundColor: "transparent",
-            tooltip: {
-              trigger: "axis",
-              axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }] },
-              backgroundColor: tc.tooltipBg,
-              borderColor: tc.axisLine,
-              textStyle: { color: tc.text, fontSize: 12 },
-              formatter: function (params) {
-                if (!params || !params.length) return "";
-                const idx = params[0].dataIndex;
-                const dt = bDates[idx];
-                const sh = seriesNorm[idx];
-                const chg = diffNorm[idx];
-                const chgColor = chg > 0 ? "#dc2626" : chg < 0 ? "#16a34a" : tc.text;
-                return `
-                  <div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">
-                    📅 ${dt} · ${grp.name}
-                  </div>
-                  <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
-                    <span>🏦 系列总份额：</span>
-                    <strong style="font-family:monospace;">${sh != null ? fmt(sh) : "—"} 亿份</strong>
-                  </div>
-                  <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
-                    <span>📊 较前日变化：</span>
-                    <strong style="font-family:monospace;color:${chgColor};">${chg != null ? sign(chg) : "—"} 亿份</strong>
-                  </div>
-                `;
-              },
-            },
-            legend: {
-              top: 2,
-              left: "center",
-              textStyle: { color: tc.text, fontSize: 12 },
-            },
-            axisPointer: {
-              link: [{ xAxisIndex: "all" }],
-            },
-            grid: [
-              { left: 76, right: 28, top: 38, height: "46%" },
-              { left: 76, right: 28, top: "60%", height: "23%" },
-            ],
-            xAxis: [
-              {
-                type: "category",
-                data: bDates,
-                gridIndex: 0,
-                boundaryGap: false,
-                axisLine: { lineStyle: { color: tc.axisLine } },
-                axisLabel: { show: false },
-                axisTick: { show: false },
-                splitLine: { show: true, lineStyle: { color: tc.gridLine } },
-              },
-              {
-                type: "category",
-                data: bDates,
-                gridIndex: 1,
-                boundaryGap: true,
-                axisLine: { lineStyle: { color: tc.axisLine } },
-                axisLabel: { color: tc.subText, fontSize: 11, hideOverlap: true },
-                splitLine: { show: true, lineStyle: { color: tc.gridLine } },
-              },
-            ],
-            yAxis: [
-              {
-                type: "value",
-                name: "总份额(亿份)",
-                gridIndex: 0,
-                scale: true,
-                nameTextStyle: { color: tc.subText, fontSize: 11.5 },
-                axisLabel: { color: tc.subText, fontSize: 11 },
-                splitLine: { lineStyle: { color: tc.gridLine } },
-              },
-              {
-                type: "value",
-                name: "日变化(亿份)",
-                gridIndex: 1,
-                nameTextStyle: { color: tc.subText, fontSize: 11 },
-                axisLabel: { color: tc.subText, fontSize: 10.5 },
-                splitLine: { lineStyle: { color: tc.gridLine } },
-              },
-            ],
-            dataZoom: [
-              { type: "inside", xAxisIndex: [0, 1], start: singleSeriesZoomStart, end: singleSeriesZoomEnd },
-              {
-                type: "slider",
-                xAxisIndex: [0, 1],
-                bottom: 4,
-                height: 22,
-                start: singleSeriesZoomStart,
-                end: singleSeriesZoomEnd,
-                borderColor: tc.axisLine,
-                textStyle: { color: tc.subText },
-              },
-            ],
-            series: [
-              {
-                name: `${grp.name}总份额`,
-                type: "line",
-                xAxisIndex: 0,
-                yAxisIndex: 0,
-                showSymbol: false,
-                smooth: false,
-                connectNulls: false,
-                data: seriesNorm,
-                lineStyle: { width: 2.4, color: seriesColor },
-                itemStyle: { color: seriesColor },
-                areaStyle: { color: seriesColor, opacity: 0.08 },
-              },
-              {
-                name: `${grp.name}每日份额变化`,
-                type: "bar",
-                xAxisIndex: 1,
-                yAxisIndex: 1,
-                data: diffNorm,
-                itemStyle: {
-                  color: function (p) {
-                    if (p.value == null) return "transparent";
-                    return p.value >= 0 ? "#ef4444" : "#22c55e";
-                  },
-                },
-              },
-            ],
-          };
-
-          singleSeriesChartInstance.setOption(option, true);
+          if (singleYiYuanDom) {
+            if (!singleSeriesChartYiYuanInstance) {
+              singleSeriesChartYiYuanInstance = echarts.init(singleYiYuanDom);
+              singleSeriesChartYiYuanInstance.on("datazoom", function () {
+                const opt = singleSeriesChartYiYuanInstance.getOption();
+                if (opt.dataZoom && opt.dataZoom[0]) {
+                  singleSeriesZoomStart = opt.dataZoom[0].start;
+                  singleSeriesZoomEnd = opt.dataZoom[0].end;
+                  if (singleSeriesChartInstance) {
+                    singleSeriesChartInstance.dispatchAction({
+                      type: "dataZoom",
+                      start: singleSeriesZoomStart,
+                      end: singleSeriesZoomEnd,
+                    });
+                  }
+                }
+              });
+            }
+            singleSeriesChartYiYuanInstance.setOption(
+              buildSingleSeriesChartOption(
+                bDates,
+                seriesNorm,
+                diffNorm,
+                grp.name,
+                seriesColor,
+                singleSeriesZoomStart,
+                singleSeriesZoomEnd,
+                "亿元",
+                tc
+              ),
+              true
+            );
+          }
         }
       }
 
@@ -2438,7 +2554,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       window.addEventListener("resize", () => {
         if (broadChartInstance) broadChartInstance.resize();
+        if (broadChartYiYuanInstance) broadChartYiYuanInstance.resize();
         if (singleSeriesChartInstance) singleSeriesChartInstance.resize();
+        if (singleSeriesChartYiYuanInstance) singleSeriesChartYiYuanInstance.resize();
         chartOverview.resize();
         chartSingle.resize();
         stackedChartInstances.forEach((inst) => inst.resize());
