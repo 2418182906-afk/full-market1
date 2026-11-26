@@ -5,7 +5,7 @@
 数据源：
 1. 五大宽基指数日线：腾讯财经日K接口 (sh000688, sh000852, sh000905, sh000016, sh000300)
 2. 八大核心宽基ETF每日份额：上海证券交易所官方ETF规模接口
-3. 沪深两市七大宽基系列35只ETF每日份额汇总：broad_market.py（并自动对齐统计起点至 START_DATE）
+3. 沪深两市七大宽基系列35只ETF每日份额汇总：broad_market.py
 4. 亿元换算净值：优先读取 broad_market 净值，缺失时自动从腾讯财经拉取对应ETF日线净值序列（净份额 × 每日净值）
 
 用法：
@@ -18,7 +18,6 @@
 """
 
 import argparse
-import inspect
 import json
 import os
 import time
@@ -164,117 +163,6 @@ def _to_tx_symbol(code: str, exchange: str = "") -> str:
     return f"sz{c}"
 
 
-def _call_sync_broad_market(force_full: bool):
-    """兼容不同签名的 sync_broad_market 调用"""
-    kwargs = {}
-    try:
-        sig = inspect.signature(sync_broad_market)
-        params = sig.parameters
-        if "force_full" in params:
-            kwargs["force_full"] = force_full
-        for candidate in ("start_date", "begin_date", "since", "from_date"):
-            if candidate in params:
-                kwargs[candidate] = START_DATE
-                break
-    except Exception:
-        kwargs = {"force_full": force_full}
-    return sync_broad_market(**kwargs)
-
-
-def align_broad_market_to_start_date(broad_payload: dict, all_trading_dates: list, etf_by_date: dict) -> dict:
-    """
-    确保 broad_market 的时间轴与统计起点 START_DATE 对齐：
-    1. 裁掉早于 START_DATE 的历史点；
-    2. 若 broad_market 的首日仍晚于 START_DATE，则按已有各系列首日份额（及明细/8只ETF份额参考）向前对齐补齐日期轴，
-       保证前端“沪深两市宽基 ETF 全系列份额汇总”与“单系列 ETF 份额独立观测图”能从 2024-01-02 连续展示。
-    """
-    if not broad_payload or not broad_payload.get("groups"):
-        return broad_payload
-
-    b_dates = list(broad_payload.get("dates") or [])
-    groups = broad_payload.get("groups") or []
-
-    # 1. 过滤掉早于 START_DATE 的日期与对应序列
-    keep_indices = [i for i, d in enumerate(b_dates) if d >= START_DATE]
-    if keep_indices and len(keep_indices) < len(b_dates):
-        b_dates = [b_dates[i] for i in keep_indices]
-
-        def slice_arr(arr):
-            if not isinstance(arr, list):
-                return arr
-            return [arr[i] if i < len(arr) else None for i in keep_indices]
-
-        broad_payload["total_series"] = slice_arr(broad_payload.get("total_series"))
-        if isinstance(broad_payload.get("total_nav_series"), list):
-            broad_payload["total_nav_series"] = slice_arr(broad_payload.get("total_nav_series"))
-
-        for g in groups:
-            g["series"] = slice_arr(g.get("series"))
-            if isinstance(g.get("nav_series"), list):
-                g["nav_series"] = slice_arr(g.get("nav_series"))
-            for det in (g.get("details") or []):
-                if isinstance(det.get("series"), list):
-                    det["series"] = slice_arr(det.get("series"))
-
-    # 2. 若仍缺少 START_DATE 到当前最早 broad_market 日期之间的交易日，则补齐日期序列
-    target_dates = [d for d in all_trading_dates if d >= START_DATE]
-    if target_dates and (not b_dates or b_dates[0] > START_DATE):
-        existing_set = set(b_dates)
-        prefix_dates = [d for d in target_dates if (not b_dates or d < b_dates[0]) and d not in existing_set]
-        if prefix_dates:
-            merged_dates = sorted(prefix_dates + b_dates)
-            pos_map = {d: idx for idx, d in enumerate(merged_dates)}
-            old_pos_map = {d: idx for idx, d in enumerate(b_dates)}
-
-            def remap_series(old_arr, fallback_val=None):
-                out = [None] * len(merged_dates)
-                if isinstance(old_arr, list):
-                    for d, old_i in old_pos_map.items():
-                        if old_i < len(old_arr):
-                            out[pos_map[d]] = old_arr[old_i]
-                # 若前缀有首日有效值，向前填充；若无可用历史份额则保留 None（不在无真实份额日虚构）
-                first_valid = next((v for v in out if v is not None), fallback_val)
-                if first_valid is not None:
-                    first_idx = next((i for i, v in enumerate(out) if v is not None), None)
-                    if first_idx is not None:
-                        for i in range(0, first_idx):
-                            out[i] = first_valid
-                return out
-
-            for g in groups:
-                g["series"] = remap_series(g.get("series"))
-                if isinstance(g.get("nav_series"), list):
-                    g["nav_series"] = remap_series(g.get("nav_series"))
-                for det in (g.get("details") or []):
-                    if isinstance(det.get("series"), list):
-                        det["series"] = remap_series(det.get("series"))
-
-            # 重算 total_series（各系列非空值之和）
-            rebuilt_total = []
-            for idx in range(len(merged_dates)):
-                s_sum = 0.0
-                has_any = False
-                for g in groups:
-                    gs = g.get("series") or []
-                    v = gs[idx] if idx < len(gs) else None
-                    if v is not None:
-                        s_sum += float(v)
-                        has_any = True
-                rebuilt_total.append(round(s_sum, 4) if has_any else None)
-
-            broad_payload["dates"] = merged_dates
-            broad_payload["total_series"] = rebuilt_total
-            if isinstance(broad_payload.get("total_nav_series"), list):
-                broad_payload["total_nav_series"] = remap_series(broad_payload.get("total_nav_series"))
-            b_dates = merged_dates
-
-    if b_dates:
-        broad_payload["start_date"] = b_dates[0]
-        broad_payload["end_date"] = b_dates[-1]
-
-    return broad_payload
-
-
 def fetch_etf_daily_navs(codes_with_ex: list, existing_navs: dict, session: requests.Session) -> dict:
     """拉取宽基ETF每日净值/收盘价序列（用于 净份额 × 每日净值 换算亿元）"""
     nav_map = {k: dict(v) for k, v in (existing_navs or {}).items()}
@@ -292,7 +180,7 @@ def fetch_etf_daily_navs(codes_with_ex: list, existing_navs: dict, session: requ
                         series[d[0]] = round(val, 4)
         except Exception:
             pass
-        nav_map[code] = {k: v for k, v in series.items() if k >= START_DATE}
+        nav_map[code] = series
     return nav_map
 
 
@@ -303,6 +191,9 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
 
     b_dates = broad_payload.get("dates") or []
     groups = broad_payload.get("groups") or []
+
+    if broad_payload.get("total_nav_series") and all(g.get("nav_series") for g in groups):
+        return broad_payload
 
     default_group_nav_codes = {
         "上证50": ("510050", "SH"),
@@ -460,9 +351,8 @@ def sync_data(force_full: bool = False) -> dict:
 
     valid_dates = sorted([d for d in etf_by_date.keys() if etf_by_date[d] and d >= START_DATE])
 
-    broad_cache = _call_sync_broad_market(force_full=force_full)
+    broad_cache = sync_broad_market(force_full=force_full)
     broad_payload = build_broad_payload(broad_cache)
-    broad_payload = align_broad_market_to_start_date(broad_payload, all_trading_dates, etf_by_date)
 
     nav_targets = [
         ("510050", "SH"),
@@ -535,14 +425,8 @@ def build_frontend_payload(cache: dict) -> dict:
         etf_series[c] = vals
 
     broad_payload = cache.get("broad_market", {})
-    if broad_payload:
-        broad_payload = align_broad_market_to_start_date(
-            broad_payload,
-            dates,
-            cache.get("etf_by_date", {}),
-        )
-        if not broad_payload.get("total_nav_series"):
-            broad_payload = attach_series_nav(broad_payload, cache.get("etf_navs", {}))
+    if broad_payload and not broad_payload.get("total_nav_series"):
+        broad_payload = attach_series_nav(broad_payload, cache.get("etf_navs", {}))
 
     return {
         "updated_at": cache["updated_at"],
@@ -1751,6 +1635,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         };
       }
 
+      // =========================================================================
+      // 1. 原来的“沪深两市宽基 ETF 全系列份额汇总”图 + 新增“亿元”换算同款图（净份额 × 每日净值）
+      // =========================================================================
       let broadChartInstance = null;
       let broadChartYiYuanInstance = null;
       let singleSeriesChartInstance = null;
@@ -1927,6 +1814,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           ((B.errors || []).length ? ` 采集异常 ${B.errors.length} 项；缺失数据不以前值填充。` : "");
       }
 
+      // =========================================================================
+      // 2. 新增的独立系列图板块 + 新增“亿元”换算同款图（净份额 × 每日净值）
+      // =========================================================================
       function renderSingleSeriesSection() {
         const B = DATA.broad_market || {};
         const groups = B.groups || [];
@@ -2117,6 +2007,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       renderBroadMarket();
       renderSingleSeriesSection();
 
+      // =========================================================================
+      // DERIVED METRICS FOR 8 CORE ETFS
+      // =========================================================================
       const derived = {};
       function computeDerived() {
         DATA.etfs_meta.forEach((m) => {
@@ -2215,6 +2108,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
       renderSnapshotCards();
 
+      // =========================================================================
+      // 3. ALL-MARKET NORMALIZED OVERVIEW CHART
+      // =========================================================================
       const chartOverview = echarts.init(document.getElementById("chartOverview"));
       let overviewZoomStart = 0;
       let overviewZoomEnd = 100;
@@ -2424,6 +2320,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         });
       });
 
+      // =========================================================================
+      // 4. SINGLE BROAD-BASED / SINGLE ETF RESONANCE CHART
+      // =========================================================================
       const GROUPS = [
         { group: "科创50", index_code: "sh000688", index_name: "科创50指数", desc: "高弹性科技创新成长赛道" },
         { group: "沪深300", index_code: "sh000300", index_name: "沪深300指数", desc: "A股核心蓝筹与汇金护盘主力" },
@@ -2816,6 +2715,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       renderSubEtfPills();
       renderSingleInsightAndChart();
 
+      // =========================================================================
+      // THEME & SYNC NOTICE
+      // =========================================================================
       function showToast(msg) {
         const el = document.getElementById("toastMsg");
         el.textContent = msg;
