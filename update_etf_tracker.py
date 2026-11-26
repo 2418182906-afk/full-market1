@@ -324,8 +324,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --down-green-bg: rgba(22, 163, 74, 0.09);
       --warn-amber: #d97706;
       --warn-amber-bg: rgba(217, 119, 6, 0.11);
-      --purple-fire: #7c3aed;
-      --purple-fire-bg: rgba(124, 58, 237, 0.10);
       --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.05), 0 1px 2px rgba(15, 23, 42, 0.03);
       --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.06);
       --radius-lg: 14px;
@@ -352,8 +350,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       --down-green-bg: rgba(74, 222, 128, 0.14);
       --warn-amber: #fbbf24;
       --warn-amber-bg: rgba(251, 191, 36, 0.14);
-      --purple-fire: #a78bfa;
-      --purple-fire-bg: rgba(167, 139, 250, 0.15);
       --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.3);
       --shadow-md: 0 10px 30px rgba(0, 0, 0, 0.45);
     }
@@ -879,16 +875,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       border: 1px solid var(--border-color);
       border-radius: var(--radius-md);
     }
+    .broad-charts-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .broad-subchart-card {
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 12px 14px;
+      background: var(--bg-subtle);
+    }
     .broad-chart-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
       flex-wrap: wrap;
       gap: 8px;
-      margin: 6px 0 4px;
+      margin-bottom: 6px;
     }
     .broad-chart-title {
-      font-size: 14.5px;
+      font-size: 14px;
       font-weight: 700;
       color: var(--text-primary);
     }
@@ -898,7 +905,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     .broad-table-wrap {
       overflow: auto;
-      margin-top: 14px;
+      margin-top: 16px;
       border: 1px solid var(--border-color);
       border-radius: var(--radius-md);
     }
@@ -1018,7 +1025,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="guide-warn">⚠️ 提示：资金底先行 ≠ 价格底立刻到来，二者常有磨底时间差，仅供宏观观测辅助</div>
     </div>
 
-    <!-- Full-market aggregation: all recognized ETFs across both exchanges -->
+    <!-- Full-market aggregation: original full chart + independent series chart -->
     <section class="broad-market-panel" id="sec-broad-market">
       <div class="broad-market-head">
         <div>
@@ -1028,7 +1035,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <span class="rule-pill">按基金代码去重 · 单位：亿份</span>
       </div>
 
-      <!-- Series Selector Tabs (Switch between All 7 Combined or Any Single Series) -->
       <div class="broad-tabs-bar">
         <div class="style-tabs" id="broadSeriesTabs"></div>
         <div class="pill-group" id="broadRangeGroup">
@@ -1043,17 +1049,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div class="broad-kpis" id="broadMarketKpis"></div>
 
-      <div class="broad-chart-header">
-        <div class="broad-chart-title" id="broadChartTitle">七大系列合计总份额走势 &amp; 每日份额变化</div>
-        <div class="broad-chart-unit">上图：累计总份额（亿份） · 下图：较前一有效披露日增减（亿份，红增绿减）</div>
+      <div class="broad-charts-stack">
+        <!-- 1. 原来的“沪深两市宽基 ETF 全系列份额汇总”全市场总览图 -->
+        <div class="broad-subchart-card">
+          <div class="broad-chart-header">
+            <div class="broad-chart-title">沪深两市宽基 ETF 全系列份额汇总（七大系列合计总份额 &amp; 每日变化）</div>
+            <div class="broad-chart-unit">七大系列去重合计 · 单位：亿份</div>
+          </div>
+          <div id="broadMarketChart" style="height:400px;width:100%;"></div>
+        </div>
+
+        <!-- 2. 独立系列图（支持在七大系列合计与各独立系列之间切换，展示独立总份额与每日变化） -->
+        <div class="broad-subchart-card">
+          <div class="broad-chart-header">
+            <div class="broad-chart-title" id="broadSingleSeriesTitle">独立系列图：七大系列合计</div>
+            <div class="broad-chart-unit" id="broadSingleSeriesUnit">独立系列总份额 &amp; 较前一有效披露日变化（亿份）</div>
+          </div>
+          <div id="broadSingleSeriesChart" style="height:400px;width:100%;"></div>
+        </div>
       </div>
-      <div id="broadMarketChart" style="height:440px;width:100%;"></div>
 
       <div class="broad-table-wrap">
         <table class="broad-table">
           <thead>
             <tr>
-              <th>系列（点击行可直接切换上方图表）</th>
+              <th>系列（点击行可切换独立系列图）</th>
               <th>纳入ETF数量</th>
               <th>最新总份额（亿份）</th>
               <th>较前一披露日变化（亿份）</th>
@@ -1166,12 +1186,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
 
       // =========================================================================
-      // SECTION 0: FULL-MARKET BROAD ETF SERIES AGGREGATION (WITH SERIES TABS)
+      // SECTION 0: FULL-MARKET BROAD ETF SERIES AGGREGATION
       // =========================================================================
       let activeBroadSeriesId = "TOTAL";
       let broadZoomStart = 0;
       let broadZoomEnd = 100;
-      let broadChartInstance = null;
+      let broadTotalChartInstance = null;
+      let broadSingleChartInstance = null;
 
       function normalizeToYi(arr) {
         if (!Array.isArray(arr) || !arr.length) return [];
@@ -1197,6 +1218,137 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           }
         }
         return diff;
+      }
+
+      function buildSeriesChartOption(bDates, seriesData, diffData, labelName, lineColor, tc) {
+        const fmt = (v) =>
+          v == null ? "—" : Number(v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const sign = (v) => (v == null ? "—" : (v > 0 ? "+" : "") + fmt(v));
+
+        return {
+          backgroundColor: "transparent",
+          tooltip: {
+            trigger: "axis",
+            axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }] },
+            backgroundColor: tc.tooltipBg,
+            borderColor: tc.axisLine,
+            textStyle: { color: tc.text, fontSize: 12 },
+            formatter: function (params) {
+              if (!params || !params.length) return "";
+              const idx = params[0].dataIndex;
+              const dt = bDates[idx];
+              const sh = seriesData[idx];
+              const chg = diffData[idx];
+              const chgColor = chg > 0 ? "#dc2626" : chg < 0 ? "#16a34a" : tc.text;
+              return `
+                <div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">
+                  📅 ${dt} · ${labelName}
+                </div>
+                <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
+                  <span>🏦 总份额：</span>
+                  <strong style="font-family:monospace;">${sh != null ? fmt(sh) : "—"} 亿份</strong>
+                </div>
+                <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
+                  <span>📊 较前日变化：</span>
+                  <strong style="font-family:monospace;color:${chgColor};">${chg != null ? sign(chg) : "—"} 亿份</strong>
+                </div>
+              `;
+            },
+          },
+          legend: {
+            top: 2,
+            left: "center",
+            textStyle: { color: tc.text, fontSize: 12 },
+          },
+          axisPointer: {
+            link: [{ xAxisIndex: "all" }],
+          },
+          grid: [
+            { left: 68, right: 28, top: 36, height: "44%" },
+            { left: 68, right: 28, top: "58%", height: "27%" },
+          ],
+          xAxis: [
+            {
+              type: "category",
+              data: bDates,
+              gridIndex: 0,
+              boundaryGap: false,
+              axisLine: { lineStyle: { color: tc.axisLine } },
+              axisLabel: { show: false },
+              axisTick: { show: false },
+              splitLine: { show: true, lineStyle: { color: tc.gridLine } },
+            },
+            {
+              type: "category",
+              data: bDates,
+              gridIndex: 1,
+              boundaryGap: true,
+              axisLine: { lineStyle: { color: tc.axisLine } },
+              axisLabel: { color: tc.subText, fontSize: 11, hideOverlap: true },
+              splitLine: { show: true, lineStyle: { color: tc.gridLine } },
+            },
+          ],
+          yAxis: [
+            {
+              type: "value",
+              name: "总份额(亿份)",
+              gridIndex: 0,
+              scale: true,
+              nameTextStyle: { color: tc.subText, fontSize: 11.5 },
+              axisLabel: { color: tc.subText, fontSize: 11 },
+              splitLine: { lineStyle: { color: tc.gridLine } },
+            },
+            {
+              type: "value",
+              name: "日变化(亿份)",
+              gridIndex: 1,
+              nameTextStyle: { color: tc.subText, fontSize: 11 },
+              axisLabel: { color: tc.subText, fontSize: 10.5 },
+              splitLine: { lineStyle: { color: tc.gridLine } },
+            },
+          ],
+          dataZoom: [
+            { type: "inside", xAxisIndex: [0, 1], start: broadZoomStart, end: broadZoomEnd },
+            {
+              type: "slider",
+              xAxisIndex: [0, 1],
+              bottom: 4,
+              height: 22,
+              start: broadZoomStart,
+              end: broadZoomEnd,
+              borderColor: tc.axisLine,
+              textStyle: { color: tc.subText },
+            },
+          ],
+          series: [
+            {
+              name: `${labelName}总份额`,
+              type: "line",
+              xAxisIndex: 0,
+              yAxisIndex: 0,
+              showSymbol: false,
+              smooth: false,
+              connectNulls: false,
+              data: seriesData,
+              lineStyle: { width: 2.3, color: lineColor },
+              itemStyle: { color: lineColor },
+              areaStyle: { color: lineColor, opacity: 0.08 },
+            },
+            {
+              name: `${labelName}每日变化`,
+              type: "bar",
+              xAxisIndex: 1,
+              yAxisIndex: 1,
+              data: diffData,
+              itemStyle: {
+                color: function (p) {
+                  if (p.value == null) return "transparent";
+                  return p.value >= 0 ? "#ef4444" : "#22c55e";
+                },
+              },
+            },
+          ],
+        };
       }
 
       function renderBroadMarket() {
@@ -1233,22 +1385,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         });
 
         const totalSeriesNorm = normalizeToYi(B.total_series || []);
+        const totalDiffNorm = computeDiffFromPrevValid(totalSeriesNorm);
+
         const selectedGroup = groups.find((g) => g.id === activeBroadSeriesId);
-        const activeSeries = selectedGroup ? normalizeToYi(selectedGroup.series || []) : totalSeriesNorm;
-        const activeDiff = computeDiffFromPrevValid(activeSeries);
-        const activeName = selectedGroup ? selectedGroup.name : "七大系列合计";
-        const activeColor = selectedGroup ? selectedGroup.color || "#1d4ed8" : "#1d4ed8";
+        const singleSeriesNorm = selectedGroup ? normalizeToYi(selectedGroup.series || []) : totalSeriesNorm;
+        const singleDiffNorm = computeDiffFromPrevValid(singleSeriesNorm);
+        const singleLabel = selectedGroup ? selectedGroup.name : "七大系列合计";
+        const singleColor = selectedGroup ? selectedGroup.color || "#1d4ed8" : "#1d4ed8";
 
         let latestVal = null;
         let prevVal = null;
         let latestDate = B.end_date || "—";
-        for (let i = activeSeries.length - 1; i >= 0; i--) {
-          if (activeSeries[i] != null) {
+        for (let i = singleSeriesNorm.length - 1; i >= 0; i--) {
+          if (singleSeriesNorm[i] != null) {
             if (latestVal == null) {
-              latestVal = activeSeries[i];
+              latestVal = singleSeriesNorm[i];
               latestDate = bDates[i] || latestDate;
             } else if (prevVal == null) {
-              prevVal = activeSeries[i];
+              prevVal = singleSeriesNorm[i];
               break;
             }
           }
@@ -1261,15 +1415,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const kpis = document.getElementById("broadMarketKpis");
         kpis.innerHTML = `
           <div class="broad-kpi">
-            <div class="k-label">${activeName} · 最新总份额</div>
+            <div class="k-label">${singleLabel} · 最新总份额</div>
             <div class="k-value">${fmt(latestVal)} <small>亿份</small></div>
           </div>
           <div class="broad-kpi">
-            <div class="k-label">${activeName} · 较前一披露日变化</div>
+            <div class="k-label">${singleLabel} · 较前一披露日变化</div>
             <div class="k-value" style="color:${latestChange > 0 ? "var(--up-red)" : latestChange < 0 ? "var(--down-green)" : "inherit"}">${sign(latestChange)} <small>亿份</small></div>
           </div>
           <div class="broad-kpi">
-            <div class="k-label">${activeName} · 纳入ETF数量</div>
+            <div class="k-label">${singleLabel} · 纳入ETF数量</div>
             <div class="k-value">${activeCount} <small>只</small></div>
           </div>
           <div class="broad-kpi">
@@ -1278,152 +1432,67 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
         `;
 
-        document.getElementById("broadChartTitle").textContent = `${activeName}总份额走势 & 每日份额变化`;
+        document.getElementById("broadSingleSeriesTitle").textContent = `独立系列图：${singleLabel}`;
 
-        const chartDom = document.getElementById("broadMarketChart");
-        if (window.echarts && chartDom && bDates.length) {
-          if (!broadChartInstance) {
-            broadChartInstance = echarts.init(chartDom);
-            broadChartInstance.on("datazoom", function () {
-              const opt = broadChartInstance.getOption();
-              if (opt.dataZoom && opt.dataZoom[0]) {
-                broadZoomStart = opt.dataZoom[0].start;
-                broadZoomEnd = opt.dataZoom[0].end;
-              }
-            });
+        const totalDom = document.getElementById("broadMarketChart");
+        const singleDom = document.getElementById("broadSingleSeriesChart");
+        const tc = getThemeColors();
+
+        if (window.echarts && bDates.length) {
+          if (totalDom) {
+            if (!broadTotalChartInstance) {
+              broadTotalChartInstance = echarts.init(totalDom);
+              broadTotalChartInstance.on("datazoom", function () {
+                const opt = broadTotalChartInstance.getOption();
+                if (opt.dataZoom && opt.dataZoom[0]) {
+                  broadZoomStart = opt.dataZoom[0].start;
+                  broadZoomEnd = opt.dataZoom[0].end;
+                  if (broadSingleChartInstance) {
+                    broadSingleChartInstance.dispatchAction({
+                      type: "dataZoom",
+                      start: broadZoomStart,
+                      end: broadZoomEnd,
+                    });
+                  }
+                }
+              });
+            }
+            broadTotalChartInstance.setOption(
+              buildSeriesChartOption(bDates, totalSeriesNorm, totalDiffNorm, "七大系列合计", "#1d4ed8", tc),
+              true
+            );
           }
-          const tc = getThemeColors();
-          const option = {
-            backgroundColor: "transparent",
-            tooltip: {
-              trigger: "axis",
-              axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }] },
-              backgroundColor: tc.tooltipBg,
-              borderColor: tc.axisLine,
-              textStyle: { color: tc.text, fontSize: 12 },
-              formatter: function (params) {
-                if (!params || !params.length) return "";
-                const idx = params[0].dataIndex;
-                const dt = bDates[idx];
-                const sh = activeSeries[idx];
-                const chg = activeDiff[idx];
-                const chgColor = chg > 0 ? "#dc2626" : chg < 0 ? "#16a34a" : tc.text;
-                return `
-                  <div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">
-                    📅 ${dt} · ${activeName}
-                  </div>
-                  <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
-                    <span>🏦 系列总份额：</span>
-                    <strong style="font-family:monospace;">${sh != null ? fmt(sh) : "—"} 亿份</strong>
-                  </div>
-                  <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
-                    <span>📊 较前日增减：</span>
-                    <strong style="font-family:monospace;color:${chgColor};">${chg != null ? sign(chg) : "—"} 亿份</strong>
-                  </div>
-                `;
-              },
-            },
-            legend: {
-              top: 2,
-              left: "center",
-              textStyle: { color: tc.text, fontSize: 12 },
-            },
-            axisPointer: {
-              link: [{ xAxisIndex: "all" }],
-            },
-            grid: [
-              { left: 68, right: 28, top: 38, height: "44%" },
-              { left: 68, right: 28, top: "58%", height: "27%" },
-            ],
-            xAxis: [
-              {
-                type: "category",
-                data: bDates,
-                gridIndex: 0,
-                boundaryGap: false,
-                axisLine: { lineStyle: { color: tc.axisLine } },
-                axisLabel: { show: false },
-                axisTick: { show: false },
-                splitLine: { show: true, lineStyle: { color: tc.gridLine } },
-              },
-              {
-                type: "category",
-                data: bDates,
-                gridIndex: 1,
-                boundaryGap: true,
-                axisLine: { lineStyle: { color: tc.axisLine } },
-                axisLabel: { color: tc.subText, fontSize: 11, hideOverlap: true },
-                splitLine: { show: true, lineStyle: { color: tc.gridLine } },
-              },
-            ],
-            yAxis: [
-              {
-                type: "value",
-                name: "总份额(亿份)",
-                gridIndex: 0,
-                scale: true,
-                nameTextStyle: { color: tc.subText, fontSize: 11.5 },
-                axisLabel: { color: tc.subText, fontSize: 11 },
-                splitLine: { lineStyle: { color: tc.gridLine } },
-              },
-              {
-                type: "value",
-                name: "日变化(亿份)",
-                gridIndex: 1,
-                nameTextStyle: { color: tc.subText, fontSize: 11 },
-                axisLabel: { color: tc.subText, fontSize: 10.5 },
-                splitLine: { lineStyle: { color: tc.gridLine } },
-              },
-            ],
-            dataZoom: [
-              { type: "inside", xAxisIndex: [0, 1], start: broadZoomStart, end: broadZoomEnd },
-              {
-                type: "slider",
-                xAxisIndex: [0, 1],
-                bottom: 4,
-                height: 22,
-                start: broadZoomStart,
-                end: broadZoomEnd,
-                borderColor: tc.axisLine,
-                textStyle: { color: tc.subText },
-              },
-            ],
-            series: [
-              {
-                name: `${activeName}总份额`,
-                type: "line",
-                xAxisIndex: 0,
-                yAxisIndex: 0,
-                showSymbol: false,
-                smooth: false,
-                connectNulls: false,
-                data: activeSeries,
-                lineStyle: { width: 2.4, color: activeColor },
-                itemStyle: { color: activeColor },
-                areaStyle: {
-                  color: activeColor,
-                  opacity: 0.08,
-                },
-              },
-              {
-                name: `${activeName}每日份额变化`,
-                type: "bar",
-                xAxisIndex: 1,
-                yAxisIndex: 1,
-                data: activeDiff,
-                itemStyle: {
-                  color: function (p) {
-                    if (p.value == null) return "transparent";
-                    return p.value >= 0 ? "#ef4444" : "#22c55e";
-                  },
-                },
-              },
-            ],
-          };
-          broadChartInstance.setOption(option, true);
-        } else if (chartDom) {
-          chartDom.innerHTML =
-            '<div style="padding:40px;text-align:center;color:var(--text-muted)">等待首次全市场数据采集</div>';
+
+          if (singleDom) {
+            if (!broadSingleChartInstance) {
+              broadSingleChartInstance = echarts.init(singleDom);
+              broadSingleChartInstance.on("datazoom", function () {
+                const opt = broadSingleChartInstance.getOption();
+                if (opt.dataZoom && opt.dataZoom[0]) {
+                  broadZoomStart = opt.dataZoom[0].start;
+                  broadZoomEnd = opt.dataZoom[0].end;
+                  if (broadTotalChartInstance) {
+                    broadTotalChartInstance.dispatchAction({
+                      type: "dataZoom",
+                      start: broadZoomStart,
+                      end: broadZoomEnd,
+                    });
+                  }
+                }
+              });
+            }
+            broadSingleChartInstance.setOption(
+              buildSeriesChartOption(bDates, singleSeriesNorm, singleDiffNorm, singleLabel, singleColor, tc),
+              true
+            );
+          }
+        } else {
+          if (totalDom) {
+            totalDom.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">等待首次全市场数据采集</div>';
+          }
+          if (singleDom) {
+            singleDom.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">等待首次全市场数据采集</div>';
+          }
         }
 
         const tbody = document.getElementById("broadMarketRows");
@@ -2266,7 +2335,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       });
 
       window.addEventListener("resize", () => {
-        if (broadChartInstance) broadChartInstance.resize();
+        if (broadTotalChartInstance) broadTotalChartInstance.resize();
+        if (broadSingleChartInstance) broadSingleChartInstance.resize();
         chartOverview.resize();
         chartSingle.resize();
         stackedChartInstances.forEach((inst) => inst.resize());
