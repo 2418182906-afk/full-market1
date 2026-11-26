@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-宽基 ETF 份额追踪 & 资金底背离监测系统 (QTYX V3.6.6 网页复刻增强版)
+宽基 ETF 份额追踪 & 资金底背离监测系统
 数据源：
 1. 五大宽基指数日线：腾讯财经日K接口 (sh000688, sh000852, sh000905, sh000016, sh000300)
 2. 八大核心宽基ETF每日份额：上海证券交易所官方ETF规模接口
 3. 沪深两市七大宽基系列35只ETF每日份额汇总：broad_market.py
+4. 亿元换算净值：优先读取 broad_market 净值，缺失时自动从腾讯财经拉取对应ETF日线净值序列（净份额 × 每日净值）
 
 用法：
 - 更新数据并生成独立HTML看板：
@@ -150,6 +151,144 @@ ETFS_META = [
 ]
 
 
+def _to_tx_symbol(code: str, exchange: str = "") -> str:
+    c = str(code).strip()
+    ex = str(exchange).upper()
+    if c.startswith(("sh", "sz")):
+        return c
+    if "SH" in ex or "沪" in ex or c.startswith(("5", "6")):
+        return f"sh{c}"
+    return f"sz{c}"
+
+
+def fetch_etf_daily_navs(codes_with_ex: list, existing_navs: dict, session: requests.Session) -> dict:
+    """拉取宽基ETF每日净值/收盘价序列（用于 净份额 × 每日净值 换算亿元）"""
+    nav_map = {k: dict(v) for k, v in (existing_navs or {}).items()}
+    for code, ex in codes_with_ex:
+        sym = _to_tx_symbol(code, ex)
+        series = nav_map.get(code, {})
+        try:
+            url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,{START_DATE},2029-12-31,1500,qfq"
+            resp = session.get(url, timeout=12).json()
+            days = resp.get("data", {}).get(sym, {}).get("qfqday") or resp.get("data", {}).get(sym, {}).get("day") or []
+            for d in days:
+                if len(d) >= 3 and d[0] >= START_DATE:
+                    val = float(d[2])
+                    if val > 0:
+                        series[d[0]] = round(val, 4)
+        except Exception:
+            pass
+        nav_map[code] = series
+    return nav_map
+
+
+def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
+    """为 broad_market 各系列及七大系列合计计算每日净值序列（nav_series）"""
+    if not broad_payload or not broad_payload.get("groups"):
+        return broad_payload
+
+    b_dates = broad_payload.get("dates") or []
+    groups = broad_payload.get("groups") or []
+
+    # 若 broad_market 本身已带 nav_series，则保留
+    if broad_payload.get("total_nav_series") and all(g.get("nav_series") for g in groups):
+        return broad_payload
+
+    # 收集所有明细 ETF 的代码与交易所
+    all_items = []
+    for g in groups:
+        for det in (g.get("details") or []):
+            c = str(det.get("code") or "").strip()
+            if c:
+                all_items.append((c, str(det.get("exchange") or "")))
+
+    # 补充默认代表 ETF（当 details 缺少历史逐日份额时作为兜底净值参考）
+    default_group_nav_codes = {
+        "上证50": ("510050", "SH"),
+        "沪深300": ("510300", "SH"),
+        "中证500": ("510500", "SH"),
+        "中证1000": ("512100", "SH"),
+        "中证A500": ("512050", "SH"),
+        "科创宽基": ("588000", "SH"),
+        "创业板": ("159915", "SZ"),
+    }
+
+    def normalize_arr(arr):
+        if not arr:
+            return []
+        valid = [v for v in arr if v is not None]
+        mx = max(valid) if valid else 0
+        scale = 10000.0 if mx > 50000 else 1.0
+        return [None if v is None else float(v) / scale for v in arr]
+
+    total_shares_norm = normalize_arr(broad_payload.get("total_series") or [])
+    total_nav_vals = []
+    group_nav_lookup = {}
+
+    for g in groups:
+        g_name = g.get("name", "")
+        g_shares_norm = normalize_arr(g.get("series") or [])
+        g_details = g.get("details") or []
+
+        # 检查是否存在逐日明细份额序列
+        has_daily_detail_series = any(isinstance(x.get("series"), list) and len(x.get("series")) == len(b_dates) for x in g_details)
+
+        g_nav_vals = []
+        fallback_code, fallback_ex = default_group_nav_codes.get(g_name, ("510300", "SH"))
+        fallback_map = etf_navs.get(fallback_code, {})
+
+        for idx, dt in enumerate(b_dates):
+            weighted_numerator = 0.0
+            weighted_denom = 0.0
+
+            if has_daily_detail_series:
+                for det in g_details:
+                    c = str(det.get("code") or "").strip()
+                    d_series = det.get("series") or []
+                    sh_val = d_series[idx] if idx < len(d_series) else None
+                    if sh_val is not None and float(sh_val) > 0:
+                        sh_yi = float(sh_val) / 10000.0 if float(sh_val) > 50000 else float(sh_val)
+                        nv = etf_navs.get(c, {}).get(dt)
+                        if nv is not None and float(nv) > 0:
+                            weighted_numerator += sh_yi * float(nv)
+                            weighted_denom += sh_yi
+
+            if weighted_denom > 0:
+                g_nav_vals.append(round(weighted_numerator / weighted_denom, 4))
+            else:
+                # 退化使用该系列代表ETF当日净值（若当日无净值则向后/向前找最近有效净值）
+                nv = fallback_map.get(dt)
+                if nv is None and fallback_map:
+                    prev_dates = [k for k in fallback_map.keys() if k <= dt]
+                    if prev_dates:
+                        nv = fallback_map[max(prev_dates)]
+                g_nav_vals.append(round(float(nv), 4) if nv is not None else None)
+
+        g["nav_series"] = g_nav_vals
+        group_nav_lookup[g_name] = g_nav_vals
+
+    # 计算七大系列合计每日加权净值 = sum(各系列份额 * 各系列净值) / sum(各系列份额)
+    for idx, dt in enumerate(b_dates):
+        num = 0.0
+        den = 0.0
+        for g in groups:
+            g_sh = normalize_arr(g.get("series") or [])
+            sh_v = g_sh[idx] if idx < len(g_sh) else None
+            nv_v = (g.get("nav_series") or [])[idx] if idx < len(g.get("nav_series") or []) else None
+            if sh_v is not None and sh_v > 0 and nv_v is not None and nv_v > 0:
+                num += sh_v * nv_v
+                den += sh_v
+        if den > 0:
+            total_nav_vals.append(round(num / den, 4))
+        else:
+            # 兜底用沪深300ETF净值
+            nv_300 = etf_navs.get("510300", {}).get(dt)
+            total_nav_vals.append(round(float(nv_300), 4) if nv_300 is not None else None)
+
+    broad_payload["total_nav_series"] = total_nav_vals
+    return broad_payload
+
+
 def sync_data(force_full: bool = False) -> dict:
     """增量同步五大宽基指数日线与上交所8只宽基ETF份额数据"""
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -163,6 +302,7 @@ def sync_data(force_full: bool = False) -> dict:
 
     etf_by_date = cache.get("etf_by_date", {})
     indices_data = cache.get("indices_data", {})
+    etf_navs = cache.get("etf_navs", {})
 
     session = requests.Session()
     all_dates_set = set()
@@ -227,6 +367,23 @@ def sync_data(force_full: bool = False) -> dict:
     broad_cache = sync_broad_market(force_full=force_full)
     broad_payload = build_broad_payload(broad_cache)
 
+    nav_targets = [
+        ("510050", "SH"),
+        ("510300", "SH"),
+        ("510500", "SH"),
+        ("512100", "SH"),
+        ("512050", "SH"),
+        ("588000", "SH"),
+        ("159915", "SZ"),
+    ]
+    for g in (broad_payload.get("groups") or []):
+        for det in (g.get("details") or []):
+            c = str(det.get("code") or "").strip()
+            if c:
+                nav_targets.append((c, str(det.get("exchange") or "")))
+    etf_navs = fetch_etf_daily_navs(nav_targets, etf_navs, session)
+    broad_payload = attach_series_nav(broad_payload, etf_navs)
+
     new_cache = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "start_date": valid_dates[0] if valid_dates else START_DATE,
@@ -237,6 +394,7 @@ def sync_data(force_full: bool = False) -> dict:
         "dates": valid_dates,
         "indices_data": indices_data,
         "etf_by_date": {d: etf_by_date[d] for d in valid_dates},
+        "etf_navs": etf_navs,
         "broad_market": broad_payload,
     }
 
@@ -279,6 +437,10 @@ def build_frontend_payload(cache: dict) -> dict:
             vals.append(round(v, 4) if v is not None else None)
         etf_series[c] = vals
 
+    broad_payload = cache.get("broad_market", {})
+    if broad_payload and not broad_payload.get("total_nav_series"):
+        broad_payload = attach_series_nav(broad_payload, cache.get("etf_navs", {}))
+
     return {
         "updated_at": cache["updated_at"],
         "start_date": cache["start_date"],
@@ -289,7 +451,7 @@ def build_frontend_payload(cache: dict) -> dict:
         "etfs_meta": ETFS_META,
         "indices_series": indices_series,
         "etf_series": etf_series,
-        "broad_market": cache.get("broad_market", {}),
+        "broad_market": broad_payload,
     }
 
 
@@ -1000,16 +1162,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div id="broadMarketChart" style="height:460px;width:100%;"></div>
 
-      <!-- 新增：换算成“亿元”为单位的一模一样样式“沪深两市宽基 ETF 全系列份额汇总”图 -->
+      <!-- 换算成“亿元”为单位（净份额 × 每日净值）的一模一样样式“沪深两市宽基 ETF 全系列份额汇总”图 -->
       <div class="section-header" style="margin-top:20px;margin-bottom:12px;padding-bottom:10px;">
         <div class="section-title-group">
           <div class="section-title" style="font-size:15.5px;">
             <span class="section-num">亿元换算</span>
             沪深两市宽基 ETF 全系列份额汇总（亿元）
           </div>
-          <div class="section-desc">换算口径：1 亿份 ≈ 1 亿元（单位：亿元），与上方“亿份”全系列份额汇总图样式保持一致</div>
+          <div class="section-desc">换算公式：净份额 × 每日净值（单位：亿元），与上方“亿份”全系列份额汇总图样式保持一致</div>
         </div>
-        <span class="rule-pill">按基金代码去重 · 单位：亿元</span>
+        <span class="rule-pill">净份额 × 每日净值 · 单位：亿元</span>
       </div>
       <div id="broadMarketChartYiYuan" style="height:460px;width:100%;"></div>
 
@@ -1060,16 +1222,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div id="singleSeriesChart" style="height:440px;width:100%;"></div>
 
-      <!-- 新增：换算成“亿元”为单位的一模一样样式“单系列 ETF 份额独立观测图” -->
+      <!-- 换算成“亿元”为单位（净份额 × 每日净值）的一模一样样式“单系列 ETF 份额独立观测图” -->
       <div class="section-header" style="margin-top:20px;margin-bottom:12px;padding-bottom:10px;">
         <div class="section-title-group">
           <div class="section-title" style="font-size:15.5px;">
             <span class="section-num">亿元换算</span>
             单系列 ETF 份额独立观测图（亿元）
           </div>
-          <div class="section-desc">换算口径：1 亿份 ≈ 1 亿元（单位：亿元），与上方“亿份”单系列独立观测图样式保持一致</div>
+          <div class="section-desc">换算公式：净份额 × 每日净值（单位：亿元），与上方“亿份”单系列独立观测图样式保持一致</div>
         </div>
-        <span class="rule-pill">单位：亿元</span>
+        <span class="rule-pill">净份额 × 每日净值 · 单位：亿元</span>
       </div>
       <div id="singleSeriesChartYiYuan" style="height:440px;width:100%;"></div>
     </section>
@@ -1181,6 +1343,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return arr.map((v) => (v == null || isNaN(v) ? null : +(Number(v) / scale).toFixed(4)));
       }
 
+      function multiplySharesByNav(sharesYiArr, navArr) {
+        if (!Array.isArray(sharesYiArr) || !sharesYiArr.length) return [];
+        return sharesYiArr.map((sh, idx) => {
+          if (sh == null || isNaN(sh)) return null;
+          const nv = Array.isArray(navArr) ? navArr[idx] : null;
+          if (nv == null || isNaN(nv) || Number(nv) <= 0) return null;
+          return +(Number(sh) * Number(nv)).toFixed(4);
+        });
+      }
+
       function computeDiffFromPrevValid(series) {
         const diff = new Array(series.length).fill(null);
         let prevValid = null;
@@ -1199,22 +1371,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return diff;
       }
 
-      function buildBroadMultiOption(bDates, groups, totalSeriesNorm, totalDiffNorm, unitText, tc) {
+      function buildBroadMultiOption(bDates, seriesList, totalSeriesVals, totalDiffVals, navArr, unitText, tc) {
         const fmt = (v) =>
           v == null ? "—" : Number(v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         const sign = (v) => (v == null ? "—" : (v > 0 ? "+" : "") + fmt(v));
 
-        const lineSeries = groups.map((g) => ({
-          name: g.name,
+        const lineSeries = seriesList.map((item) => ({
+          name: item.name,
           type: "line",
           xAxisIndex: 0,
           yAxisIndex: 0,
           showSymbol: false,
           smooth: false,
           connectNulls: false,
-          data: normalizeToYi(g.series || []),
-          lineStyle: { width: 1.9, color: g.color || undefined },
-          itemStyle: { color: g.color || undefined },
+          data: item.data,
+          lineStyle: { width: 1.9, color: item.color || undefined },
+          itemStyle: { color: item.color || undefined },
         }));
 
         lineSeries.push({
@@ -1225,17 +1397,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           showSymbol: false,
           smooth: false,
           connectNulls: false,
-          data: totalSeriesNorm,
+          data: totalSeriesVals,
           lineStyle: { width: 2.5, color: "#7c3aed" },
           itemStyle: { color: "#7c3aed" },
         });
 
         lineSeries.push({
-          name: `七大系列合计每日份额变化(${unitText})`,
+          name: `七大系列合计每日变化(${unitText})`,
           type: "bar",
           xAxisIndex: 1,
           yAxisIndex: 1,
-          data: totalDiffNorm,
+          data: totalDiffVals,
           itemStyle: {
             color: function (p) {
               if (p.value == null) return "transparent";
@@ -1256,9 +1428,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               if (!params || !params.length) return "";
               const idx = params[0].dataIndex;
               const dt = bDates[idx];
-              const chg = totalDiffNorm[idx];
+              const chg = totalDiffVals[idx];
               const chgColor = chg > 0 ? "#dc2626" : chg < 0 ? "#16a34a" : tc.text;
-              let html = `<div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">📅 ${dt}</div>`;
+              const nv = Array.isArray(navArr) ? navArr[idx] : null;
+              let html = `<div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">📅 ${dt}${unitText === "亿元" && nv != null ? ` · 净值 ${Number(nv).toFixed(4)}` : ""}</div>`;
               params.forEach((p) => {
                 if (p.value == null || p.seriesType === "bar") return;
                 html += `<div style="display:flex;justify-content:space-between;gap:16px;line-height:1.65;">
@@ -1343,7 +1516,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         };
       }
 
-      function buildSingleSeriesChartOption(bDates, seriesNorm, diffNorm, grpName, seriesColor, zoomStart, zoomEnd, unitText, tc) {
+      function buildSingleSeriesChartOption(bDates, seriesVals, diffVals, navArr, grpName, seriesColor, zoomStart, zoomEnd, unitText, tc) {
         const fmt = (v) =>
           v == null ? "—" : Number(v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         const sign = (v) => (v == null ? "—" : (v > 0 ? "+" : "") + fmt(v));
@@ -1360,15 +1533,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               if (!params || !params.length) return "";
               const idx = params[0].dataIndex;
               const dt = bDates[idx];
-              const sh = seriesNorm[idx];
-              const chg = diffNorm[idx];
+              const sh = seriesVals[idx];
+              const chg = diffVals[idx];
               const chgColor = chg > 0 ? "#dc2626" : chg < 0 ? "#16a34a" : tc.text;
+              const nv = Array.isArray(navArr) ? navArr[idx] : null;
               return `
                 <div style="font-weight:700;margin-bottom:6px;border-bottom:1px solid ${tc.axisLine};padding-bottom:4px;">
-                  📅 ${dt} · ${grpName}
+                  📅 ${dt} · ${grpName}${unitText === "亿元" && nv != null ? ` · 净值 ${Number(nv).toFixed(4)}` : ""}
                 </div>
                 <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
-                  <span>🏦 系列总份额：</span>
+                  <span>🏦 系列总${unitText === "亿元" ? "规模" : "份额"}：</span>
                   <strong style="font-family:monospace;">${sh != null ? fmt(sh) : "—"} ${unitText}</strong>
                 </div>
                 <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
@@ -1414,7 +1588,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           yAxis: [
             {
               type: "value",
-              name: `总份额(${unitText})`,
+              name: `总${unitText === "亿元" ? "规模" : "份额"}(${unitText})`,
               gridIndex: 0,
               scale: true,
               nameTextStyle: { color: tc.subText, fontSize: 11.5 },
@@ -1445,24 +1619,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           ],
           series: [
             {
-              name: `${grpName}总份额(${unitText})`,
+              name: `${grpName}总${unitText === "亿元" ? "规模" : "份额"}(${unitText})`,
               type: "line",
               xAxisIndex: 0,
               yAxisIndex: 0,
               showSymbol: false,
               smooth: false,
               connectNulls: false,
-              data: seriesNorm,
+              data: seriesVals,
               lineStyle: { width: 2.4, color: seriesColor },
               itemStyle: { color: seriesColor },
               areaStyle: { color: seriesColor, opacity: 0.08 },
             },
             {
-              name: `${grpName}每日份额变化(${unitText})`,
+              name: `${grpName}每日变化(${unitText})`,
               type: "bar",
               xAxisIndex: 1,
               yAxisIndex: 1,
-              data: diffNorm,
+              data: diffVals,
               itemStyle: {
                 color: function (p) {
                   if (p.value == null) return "transparent";
@@ -1475,7 +1649,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
 
       // =========================================================================
-      // 1. 原来的“沪深两市宽基 ETF 全系列份额汇总”图 + 新增“亿元”换算同款图
+      // 1. 原来的“沪深两市宽基 ETF 全系列份额汇总”图 + 新增“亿元”换算同款图（净份额 × 每日净值）
       // =========================================================================
       let broadChartInstance = null;
       let broadChartYiYuanInstance = null;
@@ -1495,6 +1669,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         const totalSeriesNorm = normalizeToYi(B.total_series || []);
         const totalDiffNorm = computeDiffFromPrevValid(totalSeriesNorm);
+
+        const totalNavArr = B.total_nav_series || [];
+        const totalSeriesYiYuan = multiplySharesByNav(totalSeriesNorm, totalNavArr);
+        const totalDiffYiYuan = computeDiffFromPrevValid(totalSeriesYiYuan);
 
         const totalLatestNorm = totalSeriesNorm.filter((v) => v != null).slice(-1)[0] ?? B.total_latest;
         const totalPrevNorm = totalSeriesNorm.filter((v) => v != null).slice(-2, -1)[0];
@@ -1527,12 +1705,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const tc = getThemeColors();
 
         if (window.echarts && bDates.length) {
+          const shareSeriesList = groups.map((g) => ({
+            name: g.name,
+            data: normalizeToYi(g.series || []),
+            color: g.color || undefined,
+          }));
+
+          const yiyuanSeriesList = groups.map((g) => {
+            const gSh = normalizeToYi(g.series || []);
+            return {
+              name: g.name,
+              data: multiplySharesByNav(gSh, g.nav_series || totalNavArr),
+              color: g.color || undefined,
+            };
+          });
+
           if (totalDom) {
             if (!broadChartInstance) {
               broadChartInstance = echarts.init(totalDom);
             }
             broadChartInstance.setOption(
-              buildBroadMultiOption(bDates, groups, totalSeriesNorm, totalDiffNorm, "亿份", tc),
+              buildBroadMultiOption(bDates, shareSeriesList, totalSeriesNorm, totalDiffNorm, totalNavArr, "亿份", tc),
               true
             );
           }
@@ -1542,7 +1735,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               broadChartYiYuanInstance = echarts.init(totalYiYuanDom);
             }
             broadChartYiYuanInstance.setOption(
-              buildBroadMultiOption(bDates, groups, totalSeriesNorm, totalDiffNorm, "亿元", tc),
+              buildBroadMultiOption(bDates, yiyuanSeriesList, totalSeriesYiYuan, totalDiffYiYuan, totalNavArr, "亿元", tc),
               true
             );
           }
@@ -1635,7 +1828,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
 
       // =========================================================================
-      // 2. 新增的独立系列图板块 + 新增“亿元”换算同款图
+      // 2. 新增的独立系列图板块 + 新增“亿元”换算同款图（净份额 × 每日净值）
       // =========================================================================
       function renderSingleSeriesSection() {
         const B = DATA.broad_market || {};
@@ -1672,6 +1865,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const grp = groups.find((g) => g.id === selectedSingleSeriesId) || groups[0];
         const seriesNorm = normalizeToYi(grp.series || []);
         const diffNorm = computeDiffFromPrevValid(seriesNorm);
+
+        const grpNavArr = grp.nav_series || B.total_nav_series || [];
+        const seriesYiYuan = multiplySharesByNav(seriesNorm, grpNavArr);
+        const diffYiYuan = computeDiffFromPrevValid(seriesYiYuan);
+
         const seriesColor = grp.color || "#1d4ed8";
 
         const fmt = (v) =>
@@ -1680,6 +1878,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         let latestVal = null;
         let prevVal = null;
+        let latestYiYuan = null;
+        let prevYiYuan = null;
         let latestDate = B.end_date || "—";
         for (let i = seriesNorm.length - 1; i >= 0; i--) {
           if (seriesNorm[i] != null) {
@@ -1688,11 +1888,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               latestDate = bDates[i] || latestDate;
             } else if (prevVal == null) {
               prevVal = seriesNorm[i];
-              break;
             }
+          }
+          if (seriesYiYuan[i] != null) {
+            if (latestYiYuan == null) latestYiYuan = seriesYiYuan[i];
+            else if (prevYiYuan == null) prevYiYuan = seriesYiYuan[i];
           }
         }
         const latestChg = latestVal != null && prevVal != null ? +(latestVal - prevVal).toFixed(4) : grp.change1;
+        const latestYiYuanChg =
+          latestYiYuan != null && prevYiYuan != null ? +(latestYiYuan - prevYiYuan).toFixed(4) : null;
 
         const insightEl = document.getElementById("singleSeriesInsight");
         insightEl.innerHTML = `
@@ -1705,12 +1910,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <span class="insight-val">${grp.count || 0} 只</span>
           </div>
           <div class="insight-item">
-            <span class="insight-label">最新系列总份额（${latestDate}）</span>
-            <span class="insight-val">${fmt(latestVal)} 亿份（${fmt(latestVal)} 亿元）</span>
+            <span class="insight-label">最新系列总份额 / 规模（${latestDate}）</span>
+            <span class="insight-val">${fmt(latestVal)} 亿份（${fmt(latestYiYuan)} 亿元）</span>
           </div>
           <div class="insight-item">
             <span class="insight-label">较前一有效披露日变化</span>
-            <span class="insight-val" style="color:${latestChg > 0 ? "var(--up-red)" : latestChg < 0 ? "var(--down-green)" : "inherit"}">${sign(latestChg)} 亿份（${sign(latestChg)} 亿元）</span>
+            <span class="insight-val" style="color:${latestChg > 0 ? "var(--up-red)" : latestChg < 0 ? "var(--down-green)" : "inherit"}">${sign(latestChg)} 亿份（${sign(latestYiYuanChg)} 亿元）</span>
           </div>
         `;
 
@@ -1742,6 +1947,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 bDates,
                 seriesNorm,
                 diffNorm,
+                grpNavArr,
                 grp.name,
                 seriesColor,
                 singleSeriesZoomStart,
@@ -1774,8 +1980,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             singleSeriesChartYiYuanInstance.setOption(
               buildSingleSeriesChartOption(
                 bDates,
-                seriesNorm,
-                diffNorm,
+                seriesYiYuan,
+                diffYiYuan,
+                grpNavArr,
                 grp.name,
                 seriesColor,
                 singleSeriesZoomStart,
