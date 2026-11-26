@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-宽基 ETF 份额追踪 & 资金底背离监测系统 (QTYX V3.6.6 网页复刻增强版)
+宽基 ETF 规模追踪 & 资金底背离监测系统 (QTYX V3.6.6 亿元口径版)
 数据源：
 1. 五大宽基指数日线：腾讯财经日K接口 (sh000688, sh000852, sh000905, sh000016, sh000300)
-2. 八大核心宽基ETF每日份额：上海证券交易所官方ETF规模接口
-3. 沪深两市七大宽基系列35只ETF每日份额汇总：broad_market.py
+2. 宽基ETF每日份额：上海证券交易所、深圳证券交易所及 broad_market.py
+3. 宽基ETF日线收盘价/净值代理：腾讯财经日K接口（用于将“亿份”换算为“亿元”）
 
 用法：
 - 更新数据并生成独立HTML看板：
   python3 update_etf_tracker.py
-- 启动本地交互Web服务（支持网页端一键同步最新上交所数据）：
+- 启动本地交互Web服务：
   python3 update_etf_tracker.py --serve --port 8765
 """
 
@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from broad_market import sync_broad_market, build_broad_payload
+from broad_market import ALL_CODES, CODE_TO_GROUP, GROUPS, sync_broad_market, build_broad_payload
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -150,8 +150,152 @@ ETFS_META = [
 ]
 
 
+def _to_sec_symbol(code: str) -> str:
+    c = str(code).strip().zfill(6)
+    return f"sz{c}" if c.startswith(("15", "16", "18", "00", "30")) else f"sh{c}"
+
+
+def _fetch_kline_close_map(session: requests.Session, symbol: str, start_date: str = START_DATE) -> dict:
+    """从腾讯财经获取日K收盘价映射 {YYYY-MM-DD: close_float}"""
+    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,{start_date},2029-12-31,1500,"
+    out = {}
+    for attempt in range(3):
+        try:
+            resp = session.get(url, timeout=15).json()
+            days = resp.get("data", {}).get(symbol, {}).get("day", [])
+            for d in days:
+                if isinstance(d, list) and len(d) >= 3 and d[0] >= start_date:
+                    out[d[0]] = round(float(d[2]), 4)
+            return out
+        except Exception:
+            time.sleep(0.25 * (attempt + 1))
+    return out
+
+
+def _convert_broad_payload_to_yi_yuan(broad_payload: dict, price_maps: dict) -> dict:
+    """将 broad_market 的份额（亿份）乘以对应 ETF 当日收盘价，换算为规模（亿元）"""
+    if not isinstance(broad_payload, dict):
+        return {}
+
+    b_dates = broad_payload.get("dates", [])
+    by_date = broad_payload.get("by_date", {})
+    groups = broad_payload.get("groups", [])
+
+    # 补充每只 ETF 的当日价格与当日规模（亿元）
+    new_by_date = {}
+    for day, rows in by_date.items():
+        if not isinstance(rows, dict):
+            continue
+        day_out = {}
+        for code, rec in rows.items():
+            if not isinstance(rec, dict):
+                continue
+            c = str(code).strip().zfill(6)
+            shares_yi = float(rec.get("shares_10k", 0.0)) / 10000.0
+            px = price_maps.get(c, {}).get(day)
+            amount_yi_yuan = round(shares_yi * px, 4) if px is not None else None
+            item = dict(rec)
+            item["shares_yi"] = round(shares_yi, 4)
+            item["price"] = px
+            item["amount_yi_yuan"] = amount_yi_yuan
+            day_out[c] = item
+        new_by_date[day] = day_out
+
+    new_groups = []
+    for g in groups:
+        gid = g.get("id")
+        series_yuan = []
+        for day in b_dates:
+            day_rows = new_by_date.get(day, {})
+            vals = [
+                r["amount_yi_yuan"]
+                for code, r in day_rows.items()
+                if str(code).zfill(6) in CODE_TO_GROUP
+                and CODE_TO_GROUP[str(code).zfill(6)] == gid
+                and r.get("amount_yi_yuan") is not None
+            ]
+            series_yuan.append(round(sum(vals), 4) if vals else None)
+
+        latest_idx = next((i for i in range(len(series_yuan) - 1, -1, -1) if series_yuan[i] is not None), None)
+        prev_idx = (
+            next((i for i in range(latest_idx - 1, -1, -1) if series_yuan[i] is not None), None)
+            if latest_idx is not None
+            else None
+        )
+        latest_val = series_yuan[latest_idx] if latest_idx is not None else None
+        prev_val = series_yuan[prev_idx] if prev_idx is not None else None
+
+        details_yuan = []
+        if latest_idx is not None:
+            lday = b_dates[latest_idx]
+            for code, rec in new_by_date.get(lday, {}).items():
+                c = str(code).zfill(6)
+                if c in CODE_TO_GROUP and CODE_TO_GROUP[c] == gid:
+                    details_yuan.append(
+                        {
+                            "code": c,
+                            "name": rec.get("name", ""),
+                            "exchange": rec.get("exchange", ""),
+                            "shares_yi": rec.get("shares_yi"),
+                            "price": rec.get("price"),
+                            "amount": rec.get("amount_yi_yuan"),
+                        }
+                    )
+        details_yuan.sort(key=lambda x: (x["amount"] is None, -(x["amount"] or 0.0)))
+
+        new_g = dict(g)
+        new_g["series"] = series_yuan
+        new_g["latest"] = latest_val
+        new_g["change1"] = (
+            round(latest_val - prev_val, 4)
+            if latest_val is not None and prev_val is not None
+            else None
+        )
+        new_g["details"] = details_yuan
+        new_groups.append(new_g)
+
+    total_series_yuan = []
+    for day in b_dates:
+        day_rows = new_by_date.get(day, {})
+        vals = [
+            r["amount_yi_yuan"]
+            for code, r in day_rows.items()
+            if str(code).zfill(6) in CODE_TO_GROUP and r.get("amount_yi_yuan") is not None
+        ]
+        total_series_yuan.append(round(sum(vals), 4) if vals else None)
+
+    t_latest_idx = next(
+        (i for i in range(len(total_series_yuan) - 1, -1, -1) if total_series_yuan[i] is not None),
+        None,
+    )
+    t_prev_idx = (
+        next((i for i in range(t_latest_idx - 1, -1, -1) if total_series_yuan[i] is not None), None)
+        if t_latest_idx is not None
+        else None
+    )
+    t_latest = total_series_yuan[t_latest_idx] if t_latest_idx is not None else None
+    t_prev = total_series_yuan[t_prev_idx] if t_prev_idx is not None else None
+
+    out_payload = dict(broad_payload)
+    out_payload["unit"] = "亿元"
+    out_payload["groups"] = new_groups
+    out_payload["total_series"] = total_series_yuan
+    out_payload["total_latest"] = t_latest
+    out_payload["total_change1"] = (
+        round(t_latest - t_prev, 4)
+        if t_latest is not None and t_prev is not None
+        else None
+    )
+    out_payload["note"] = (
+        "单位：亿元（按各ETF当日收盘价由份额折算：亿份 × 收盘价 = 亿元）。"
+        "本页面仅统计固定代码白名单中的35只指定宽基ETF。"
+        "缺失净值或缺失披露日不以前值填充。"
+    )
+    return out_payload
+
+
 def sync_data(force_full: bool = False) -> dict:
-    """增量同步五大宽基指数日线与上交所8只宽基ETF份额数据"""
+    """增量同步五大宽基指数日线、上交所8只宽基ETF份额及全市场35只ETF折算规模（亿元）"""
     os.makedirs(DATA_DIR, exist_ok=True)
     cache = {}
     if os.path.exists(CACHE_PATH) and not force_full:
@@ -163,21 +307,27 @@ def sync_data(force_full: bool = False) -> dict:
 
     etf_by_date = cache.get("etf_by_date", {})
     indices_data = cache.get("indices_data", {})
+    etf_prices_data = cache.get("etf_prices_data", {})
 
     session = requests.Session()
     all_dates_set = set()
 
     for item in INDICES_META:
         code = item["code"]
-        url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,{START_DATE},2029-12-31,1200,"
-        resp = session.get(url, timeout=15).json()
-        days = resp.get("data", {}).get(code, {}).get("day", [])
+        price_map = _fetch_kline_close_map(session, code, START_DATE)
         series = indices_data.get(code, {})
-        for d in days:
-            if d[0] >= START_DATE:
-                series[d[0]] = round(float(d[2]), 2)
-                all_dates_set.add(d[0])
+        for d, close_val in price_map.items():
+            series[d] = round(close_val, 2)
+            all_dates_set.add(d)
         indices_data[code] = series
+
+    # 同步8只核心ETF行情价格
+    for etf_meta in ETFS_META:
+        c = etf_meta["code"]
+        px_map = _fetch_kline_close_map(session, _to_sec_symbol(c), START_DATE)
+        existing_px = etf_prices_data.get(c, {})
+        existing_px.update(px_map)
+        etf_prices_data[c] = existing_px
 
     all_trading_dates = sorted(list(all_dates_set))
     target_codes = {e["code"] for e in ETFS_META}
@@ -209,14 +359,16 @@ def sync_data(force_full: bool = False) -> dict:
                 for x in js.get("result", []):
                     sc = x.get("SEC_CODE")
                     if sc in target_codes:
-                        out[sc] = round(float(x["TOT_VOL"]) / 10000.0, 4)
+                        shares_yi = float(x["TOT_VOL"]) / 10000.0
+                        px = etf_prices_data.get(sc, {}).get(d)
+                        out[sc] = round(shares_yi * px, 4) if px is not None else round(shares_yi, 4)
                 return d, out
             except Exception:
                 time.sleep(0.25 * (attempt + 1))
         return d, {}
 
     if missing_dates:
-        print(f"[Sync] 正在从上交所同步 {len(missing_dates)} 个交易日的ETF规模份额数据...")
+        print(f"[Sync] 正在从上交所同步 {len(missing_dates)} 个交易日的ETF规模数据...")
         with ThreadPoolExecutor(max_workers=16) as ex:
             for d, res in ex.map(fetch_sse_date, missing_dates):
                 if res:
@@ -224,8 +376,22 @@ def sync_data(force_full: bool = False) -> dict:
 
     valid_dates = sorted([d for d in etf_by_date.keys() if etf_by_date[d]])
 
+    # 同步35只全市场白名单ETF份额并获取全白名单收盘价，统一折算为亿元
     broad_cache = sync_broad_market(force_full=force_full)
-    broad_payload = build_broad_payload(broad_cache)
+    broad_raw_payload = build_broad_payload(broad_cache)
+
+    all_price_maps = {c: dict(etf_prices_data.get(c, {})) for c in target_codes}
+
+    def fetch_broad_px(c: str):
+        return c, _fetch_kline_close_map(session, _to_sec_symbol(c), START_DATE)
+
+    extra_codes = [c for c in sorted(ALL_CODES) if c not in all_price_maps]
+    if extra_codes:
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            for c, px_map in ex.map(fetch_broad_px, extra_codes):
+                all_price_maps[c] = px_map
+
+    broad_payload = _convert_broad_payload_to_yi_yuan(broad_raw_payload, all_price_maps)
 
     new_cache = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -236,6 +402,7 @@ def sync_data(force_full: bool = False) -> dict:
         "etfs_meta": ETFS_META,
         "dates": valid_dates,
         "indices_data": indices_data,
+        "etf_prices_data": etf_prices_data,
         "etf_by_date": {d: etf_by_date[d] for d in valid_dates},
         "broad_market": broad_payload,
     }
@@ -245,13 +412,13 @@ def sync_data(force_full: bool = False) -> dict:
 
     print(
         f"[Sync] 数据同步完成: {new_cache['start_date']} ~ {new_cache['end_date']} "
-        f"(共 {new_cache['total_days']} 个交易日)"
+        f"(共 {new_cache['total_days']} 个交易日，口径：亿元)"
     )
     return new_cache
 
 
 def build_frontend_payload(cache: dict) -> dict:
-    """将缓存数据整理为前端高密度列式JSON结构"""
+    """将缓存数据整理为前端高密度列式JSON结构（统一口径：亿元）"""
     dates = cache["dates"]
     indices_series = {}
     for idx_meta in INDICES_META:
@@ -267,15 +434,21 @@ def build_frontend_payload(cache: dict) -> dict:
         indices_series[c] = vals
 
     etf_series = {}
+    px_cache = cache.get("etf_prices_data", {})
     for etf_meta in ETFS_META:
         c = etf_meta["code"]
+        px_map = px_cache.get(c, {})
         vals = []
         last_val = None
         for d in dates:
             day_map = cache["etf_by_date"].get(d, {})
-            v = day_map.get(c, last_val)
-            if v is not None:
+            raw_v = day_map.get(c)
+            if raw_v is not None:
+                # 若缓存中已是乘以价格后的亿元，px_map[d] 存在时保持一致
+                v = raw_v
                 last_val = v
+            else:
+                v = last_val
             vals.append(round(v, 4) if v is not None else None)
         etf_series[c] = vals
 
@@ -298,7 +471,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>宽基ETF份额追踪 · 市场底背离监测系统 (QTYX-V3.6.6 Web版)</title>
+  <title>宽基ETF规模追踪 · 市场底背离监测系统 (QTYX-V3.6.6 亿元版)</title>
   <script src="./echarts.min.js"></script>
   <script>
     if (typeof window.echarts === 'undefined') {
@@ -373,7 +546,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       transition: background-color 0.2s ease, color 0.2s ease;
     }
 
-    /* Top Navigation / Header */
     .top-header {
       background: var(--bg-card);
       border-bottom: 1px solid var(--border-color);
@@ -484,7 +656,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       padding: 18px 24px 0;
     }
 
-    /* Guide / Risk Banner */
     .guide-banner {
       background: var(--bg-card);
       border: 1px solid var(--border-color);
@@ -526,7 +697,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-weight: 600;
     }
 
-    /* 8 ETF Snapshot Cards */
     .etf-grid {
       display: grid;
       grid-template-columns: repeat(8, 1fr);
@@ -551,8 +721,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       box-shadow: var(--shadow-sm);
       cursor: pointer;
       transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
-      position: relative;
-      overflow: hidden;
     }
     .etf-card:hover {
       transform: translateY(-2px);
@@ -630,7 +798,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       color: var(--text-muted);
     }
 
-    /* Section Card */
     .section-card {
       background: var(--bg-card);
       border: 1px solid var(--border-color);
@@ -674,7 +841,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       color: var(--text-muted);
     }
 
-    /* Filter Pills & Toolbar */
     .toolbar-row {
       display: flex;
       flex-wrap: wrap;
@@ -731,7 +897,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       border: 1px solid var(--border-color);
     }
 
-    /* Chart containers */
     .chart-box-overview {
       width: 100%;
       height: 580px;
@@ -752,7 +917,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       background: var(--bg-subtle);
     }
 
-    /* Style Selector Tabs */
     .style-tabs {
       display: flex;
       flex-wrap: wrap;
@@ -783,7 +947,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       box-shadow: 0 2px 8px rgba(29, 78, 216, 0.25);
     }
 
-    /* Single ETF Insight Bar */
     .insight-strip {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -821,7 +984,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-weight: 700;
     }
 
-    /* Full-market broad ETF aggregation panel */
     .broad-market-panel {
       background: var(--bg-card);
       border: 1px solid var(--border-color);
@@ -984,13 +1146,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <!-- Sticky Top Navigation -->
   <header class="top-header">
     <div class="header-inner">
       <div class="brand-group">
         <span class="brand-badge">QTYX V3.6.6</span>
         <div class="brand-title">
-          <h1>宽基 ETF 份额追踪 · 市场底背离监测系统</h1>
+          <h1>宽基 ETF 规模追踪 · 市场底背离监测系统</h1>
           <div class="brand-subtitle" id="metaSubtitle">加载中...</div>
         </div>
       </div>
@@ -1008,27 +1169,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </header>
 
   <main class="container">
-    <!-- Reading Guide & Risk Reminder -->
     <div class="guide-banner">
       <div class="guide-rules">
-        <span class="rule-pill">📏 <strong>看图统一规则</strong>：虚线 = 宽基指数走势，实线 = ETF 份额（起点归一到 100）</span>
-        <span class="rule-pill">📉 <strong>同步创新低</strong>：指数跌 + 份额跌 → 资金出逃，抛压未结束</span>
-        <span class="rule-pill">📈 <strong>资金底背离</strong>：指数持续回落 + 份额止跌拐头向上 → 大资金在低位主动申购承接</span>
+        <span class="rule-pill">📏 <strong>看图统一规则</strong>：虚线 = 宽基指数走势，实线 = ETF 规模（起点归一到 100）</span>
+        <span class="rule-pill">📉 <strong>同步创新低</strong>：指数跌 + 规模跌 → 资金出逃，抛压未结束</span>
+        <span class="rule-pill">📈 <strong>资金底背离</strong>：指数持续回落 + 规模止跌拐头向上 → 大资金在低位主动申购承接</span>
       </div>
       <div class="guide-warn">⚠️ 提示：资金底先行 ≠ 价格底立刻到来，二者常有磨底时间差，仅供宏观观测辅助</div>
     </div>
 
-    <!-- Full-market aggregation: all recognized ETFs across both exchanges -->
     <section class="broad-market-panel" id="sec-broad-market">
       <div class="broad-market-head">
         <div>
-          <h2>沪深两市宽基 ETF 全系列份额汇总</h2>
+          <h2>沪深两市宽基 ETF 全系列规模汇总</h2>
           <div class="broad-market-note">上证50 · 沪深300 · 中证500 · 中证1000 · 中证A500 · 科创宽基 · 创业板（创业板指+创业板50）</div>
         </div>
-        <span class="rule-pill">按基金代码去重 · 单位：亿份</span>
+        <span class="rule-pill">按基金代码去重 · 单位：亿元</span>
       </div>
 
-      <!-- Series Selector Tabs (Switch between All 7 Combined or Any Single Series) -->
       <div class="broad-tabs-bar">
         <div class="style-tabs" id="broadSeriesTabs"></div>
         <div class="pill-group" id="broadRangeGroup">
@@ -1044,8 +1202,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="broad-kpis" id="broadMarketKpis"></div>
 
       <div class="broad-chart-header">
-        <div class="broad-chart-title" id="broadChartTitle">七大系列合计总份额走势 &amp; 每日份额变化</div>
-        <div class="broad-chart-unit">上图：累计总份额（亿份） · 下图：较前一有效披露日增减（亿份，红增绿减）</div>
+        <div class="broad-chart-title" id="broadChartTitle">七大系列合计总规模走势 &amp; 每日规模变化</div>
+        <div class="broad-chart-unit">上图：累计总规模（亿元） · 下图：较前一有效披露日增减（亿元，红增绿减）</div>
       </div>
       <div id="broadMarketChart" style="height:440px;width:100%;"></div>
 
@@ -1055,8 +1213,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <tr>
               <th>系列（点击行可直接切换上方图表）</th>
               <th>纳入ETF数量</th>
-              <th>最新总份额（亿份）</th>
-              <th>较前一披露日变化（亿份）</th>
+              <th>最新总规模（亿元）</th>
+              <th>较前一披露日变化（亿元）</th>
               <th>明细</th>
             </tr>
           </thead>
@@ -1066,19 +1224,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="broad-status" id="broadMarketStatus"></div>
     </section>
 
-    <!-- 8 Core Broad-Based ETF Snapshot Cards -->
     <section class="etf-grid" id="etfSnapshotGrid"></section>
 
-    <!-- SECTION 1: All-Market Normalized Comparison Chart -->
     <section class="section-card" id="sec-overview">
       <div class="section-header">
         <div class="section-title-group">
           <div class="section-title">
             <span class="section-num">板块一</span>
-            主力资金动向：全市场宽基指数 &amp; ETF 份额归一对比
+            主力资金动向：全市场宽基指数 &amp; ETF 规模归一对比
           </div>
           <div class="section-desc">
-            五大宽基指数（虚线）+ 八大旗舰宽基 ETF 份额（实线）横向同框对比，一眼看清不同风格主力资金强弱与跨风格共振
+            五大宽基指数（虚线）+ 八大旗舰宽基 ETF 规模（实线，单位：亿元）横向同框对比
           </div>
         </div>
         <div class="pill-group" id="overviewPeriodGroup">
@@ -1095,7 +1251,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="pill-group" id="overviewPresetGroup">
           <span class="pill-label">线条组合预设：</span>
           <button class="pill-btn active" data-preset="ALL">📊 全部显示 (5指数+8ETF)</button>
-          <button class="pill-btn" data-preset="ONLY_ETF">📈 仅看8只ETF份额 (实线)</button>
+          <button class="pill-btn" data-preset="ONLY_ETF">📈 仅看8只ETF规模 (实线)</button>
           <button class="pill-btn" data-preset="ONLY_IDX">📉 仅看5大宽基指数 (虚线)</button>
           <button class="pill-btn" data-preset="STAR50">🚀 科创50底背离典型</button>
           <button class="pill-btn" data-preset="LARGE_CAP">🏛️ 大盘宽基 (沪深300+上证50)</button>
@@ -1110,7 +1266,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="chartOverview" class="chart-box-overview"></div>
     </section>
 
-    <!-- SECTION 2: Single Broad-Based / Single ETF Resonance Chart -->
     <section class="section-card" id="sec-single">
       <div class="section-header">
         <div class="section-title-group">
@@ -1119,7 +1274,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             单宽基 / 单 ETF 资金共振独立观测图
           </div>
           <div class="section-desc">
-            上图：左轴指数点位 + 右轴 ETF 真实份额（亿份）；下图：每日份额申赎变化柱状图（红柱净申购 / 绿柱净赎回）+ 5日累计流向
+            上图：左轴指数点位 + 右轴 ETF 规模（亿元）；下图：每日规模变化柱状图（红柱增加 / 绿柱减少，单位：亿元）
           </div>
         </div>
         <div class="pill-group">
@@ -1133,11 +1288,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
 
       <div class="insight-strip" id="singleInsightStrip"></div>
-
-      <!-- Tab view container -->
       <div id="chartSingle" class="chart-box-single"></div>
-
-      <!-- Stacked all-5-groups view container (hidden by default) -->
       <div id="stackedChartsContainer" class="stacked-charts-grid" style="display: none;"></div>
     </section>
   </main>
@@ -1165,21 +1316,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         };
       }
 
-      // =========================================================================
-      // SECTION 0: FULL-MARKET BROAD ETF SERIES AGGREGATION (WITH SERIES TABS)
-      // =========================================================================
       let activeBroadSeriesId = "TOTAL";
       let broadZoomStart = 0;
       let broadZoomEnd = 100;
       let broadChartInstance = null;
-
-      function normalizeToYi(arr) {
-        if (!Array.isArray(arr) || !arr.length) return [];
-        const valid = arr.filter((v) => v != null && !isNaN(v));
-        const maxVal = valid.length ? Math.max(...valid) : 0;
-        const scale = maxVal > 50000 ? 10000 : 1;
-        return arr.map((v) => (v == null || isNaN(v) ? null : +(Number(v) / scale).toFixed(4)));
-      }
 
       function computeDiffFromPrevValid(series) {
         const diff = new Array(series.length).fill(null);
@@ -1232,9 +1372,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           });
         });
 
-        const totalSeriesNorm = normalizeToYi(B.total_series || []);
+        const totalSeries = B.total_series || [];
         const selectedGroup = groups.find((g) => g.id === activeBroadSeriesId);
-        const activeSeries = selectedGroup ? normalizeToYi(selectedGroup.series || []) : totalSeriesNorm;
+        const activeSeries = selectedGroup ? selectedGroup.series || [] : totalSeries;
         const activeDiff = computeDiffFromPrevValid(activeSeries);
         const activeName = selectedGroup ? selectedGroup.name : "七大系列合计";
         const activeColor = selectedGroup ? selectedGroup.color || "#1d4ed8" : "#1d4ed8";
@@ -1261,24 +1401,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const kpis = document.getElementById("broadMarketKpis");
         kpis.innerHTML = `
           <div class="broad-kpi">
-            <div class="k-label">${activeName} · 最新总份额</div>
-            <div class="k-value">${fmt(latestVal)} <small>亿份</small></div>
+            <div class="k-label">${activeName} · 最新总规模</div>
+            <div class="k-value">${fmt(latestVal)} <small>亿元</small></div>
           </div>
           <div class="broad-kpi">
             <div class="k-label">${activeName} · 较前一披露日变化</div>
-            <div class="k-value" style="color:${latestChange > 0 ? "var(--up-red)" : latestChange < 0 ? "var(--down-green)" : "inherit"}">${sign(latestChange)} <small>亿份</small></div>
+            <div class="k-value" style="color:${latestChange > 0 ? "var(--up-red)" : latestChange < 0 ? "var(--down-green)" : "inherit"}">${sign(latestChange)} <small>亿元</small></div>
           </div>
           <div class="broad-kpi">
             <div class="k-label">${activeName} · 纳入ETF数量</div>
             <div class="k-value">${activeCount} <small>只</small></div>
           </div>
           <div class="broad-kpi">
-            <div class="k-label">份额数据区间（最新披露：${latestDate}）</div>
+            <div class="k-label">规模数据区间（最新披露：${latestDate}）</div>
             <div class="k-value" style="font-size:14px">${B.start_date || "—"} 至 ${B.end_date || "—"}</div>
           </div>
         `;
 
-        document.getElementById("broadChartTitle").textContent = `${activeName}总份额走势 & 每日份额变化`;
+        document.getElementById("broadChartTitle").textContent = `${activeName}总规模走势 & 每日规模变化`;
 
         const chartDom = document.getElementById("broadMarketChart");
         if (window.echarts && chartDom && bDates.length) {
@@ -1313,24 +1453,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     📅 ${dt} · ${activeName}
                   </div>
                   <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
-                    <span>🏦 系列总份额：</span>
-                    <strong style="font-family:monospace;">${sh != null ? fmt(sh) : "—"} 亿份</strong>
+                    <span>🏦 系列总规模：</span>
+                    <strong style="font-family:monospace;">${sh != null ? fmt(sh) : "—"} 亿元</strong>
                   </div>
                   <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
                     <span>📊 较前日增减：</span>
-                    <strong style="font-family:monospace;color:${chgColor};">${chg != null ? sign(chg) : "—"} 亿份</strong>
+                    <strong style="font-family:monospace;color:${chgColor};">${chg != null ? sign(chg) : "—"} 亿元</strong>
                   </div>
                 `;
               },
             },
-            legend: {
-              top: 2,
-              left: "center",
-              textStyle: { color: tc.text, fontSize: 12 },
-            },
-            axisPointer: {
-              link: [{ xAxisIndex: "all" }],
-            },
+            legend: { top: 2, left: "center", textStyle: { color: tc.text, fontSize: 12 } },
+            axisPointer: { link: [{ xAxisIndex: "all" }] },
             grid: [
               { left: 68, right: 28, top: 38, height: "44%" },
               { left: 68, right: 28, top: "58%", height: "27%" },
@@ -1359,7 +1493,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             yAxis: [
               {
                 type: "value",
-                name: "总份额(亿份)",
+                name: "总规模(亿元)",
                 gridIndex: 0,
                 scale: true,
                 nameTextStyle: { color: tc.subText, fontSize: 11.5 },
@@ -1368,7 +1502,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               },
               {
                 type: "value",
-                name: "日变化(亿份)",
+                name: "日变化(亿元)",
                 gridIndex: 1,
                 nameTextStyle: { color: tc.subText, fontSize: 11 },
                 axisLabel: { color: tc.subText, fontSize: 10.5 },
@@ -1390,7 +1524,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             ],
             series: [
               {
-                name: `${activeName}总份额`,
+                name: `${activeName}总规模`,
                 type: "line",
                 xAxisIndex: 0,
                 yAxisIndex: 0,
@@ -1400,13 +1534,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 data: activeSeries,
                 lineStyle: { width: 2.4, color: activeColor },
                 itemStyle: { color: activeColor },
-                areaStyle: {
-                  color: activeColor,
-                  opacity: 0.08,
-                },
+                areaStyle: { color: activeColor, opacity: 0.08 },
               },
               {
-                name: `${activeName}每日份额变化`,
+                name: `${activeName}每日规模变化`,
                 type: "bar",
                 xAxisIndex: 1,
                 yAxisIndex: 1,
@@ -1427,25 +1558,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
 
         const tbody = document.getElementById("broadMarketRows");
-        const totalLatestNorm = totalSeriesNorm.filter((v) => v != null).slice(-1)[0] ?? B.total_latest;
-        const totalPrevNorm = totalSeriesNorm.filter((v) => v != null).slice(-2, -1)[0];
-        const totalChangeNorm =
-          totalLatestNorm != null && totalPrevNorm != null ? +(totalLatestNorm - totalPrevNorm).toFixed(4) : B.total_change1;
+        const totalLatest = totalSeries.filter((v) => v != null).slice(-1)[0] ?? B.total_latest;
+        const totalPrev = totalSeries.filter((v) => v != null).slice(-2, -1)[0];
+        const totalChange =
+          totalLatest != null && totalPrev != null ? +(totalLatest - totalPrev).toFixed(4) : B.total_change1;
 
         tbody.innerHTML =
           groups
             .map((g, i) => {
-              const gNorm = normalizeToYi(g.series || []);
-              const gLatest = gNorm.filter((v) => v != null).slice(-1)[0] ?? g.latest;
-              const gPrev = gNorm.filter((v) => v != null).slice(-2, -1)[0];
+              const gSeries = g.series || [];
+              const gLatest = gSeries.filter((v) => v != null).slice(-1)[0] ?? g.latest;
+              const gPrev = gSeries.filter((v) => v != null).slice(-2, -1)[0];
               const gChg = gLatest != null && gPrev != null ? +(gLatest - gPrev).toFixed(4) : g.change1;
 
               const detail =
                 (g.details || [])
-                  .map((x) => {
-                    const sVal = Number(x.shares) > 50000 ? Number(x.shares) / 10000 : Number(x.shares);
-                    return `<span class="broad-chip">${x.code} ${x.name} · ${fmt(sVal)}亿份 · ${x.exchange}</span>`;
-                  })
+                  .map(
+                    (x) =>
+                      `<span class="broad-chip">${x.code} ${x.name} · ${fmt(x.amount)}亿元 · ${x.exchange}</span>`
+                  )
                   .join("") || "暂无可用明细";
 
               const isSelected = activeBroadSeriesId === g.id;
@@ -1470,8 +1601,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <tr class="${activeBroadSeriesId === "TOTAL" ? "active-series-row" : ""}" data-select-series="TOTAL" style="cursor:pointer;">
               <td><strong>七大系列合计</strong></td>
               <td class="mono-cell">${groups.reduce((a, g) => a + (g.count || 0), 0)}</td>
-              <td class="mono-cell"><strong>${fmt(totalLatestNorm)}</strong></td>
-              <td class="mono-cell" style="color:${totalChangeNorm > 0 ? "var(--up-red)" : totalChangeNorm < 0 ? "var(--down-green)" : "inherit"}">${sign(totalChangeNorm)}</td>
+              <td class="mono-cell"><strong>${fmt(totalLatest)}</strong></td>
+              <td class="mono-cell" style="color:${totalChange > 0 ? "var(--up-red)" : totalChange < 0 ? "var(--down-green)" : "inherit"}">${sign(totalChange)}</td>
               <td>按代码去重汇总</td>
             </tr>
           `;
@@ -1527,9 +1658,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       renderBroadMarket();
 
-      // =========================================================================
-      // DERIVED METRICS FOR 8 CORE ETFS
-      // =========================================================================
       const derived = {};
       function computeDerived() {
         DATA.etfs_meta.forEach((m) => {
@@ -1571,7 +1699,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       computeDerived();
 
       document.getElementById("metaSubtitle").textContent =
-        `数据区间：${DATA.start_date} 至 ${DATA.end_date}（共 ${DATA.total_days} 个交易日） · 最近同步：${DATA.updated_at} · 数据源：沪深交易所ETF份额 & 腾讯指数日线`;
+        `数据区间：${DATA.start_date} 至 ${DATA.end_date}（共 ${DATA.total_days} 个交易日） · 最近同步：${DATA.updated_at} · 统一口径：亿元`;
 
       function renderSnapshotCards() {
         const container = document.getElementById("etfSnapshotGrid");
@@ -1599,13 +1727,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   <span class="etf-card-code">${c}</span>
                 </div>
                 <div class="etf-card-share">
-                  ${share.toFixed(2)}<span>亿份</span>
+                  ${share.toFixed(2)}<span>亿元</span>
                 </div>
                 <div class="etf-card-metrics">
                   <span>当日 <strong class="${d1Cls}">${d1Str}</strong></span>
                   <span>5日 <strong class="${d5Cls}">${d5Str}</strong></span>
                 </div>
-                <div class="pct-bar-wrap" title="历史份额分位数：${pct.toFixed(1)}%">
+                <div class="pct-bar-wrap" title="历史规模分位数：${pct.toFixed(1)}%">
                   <div class="pct-bar-fill" style="width:${Math.min(100, Math.max(4, pct))}%;background:${m.color};"></div>
                 </div>
                 <div class="etf-card-foot">
@@ -1628,9 +1756,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
       renderSnapshotCards();
 
-      // =========================================================================
-      // SECTION 1: ALL-MARKET NORMALIZED OVERVIEW CHART
-      // =========================================================================
       const chartOverview = echarts.init(document.getElementById("chartOverview"));
       let overviewZoomStart = 0;
       let overviewZoomEnd = 100;
@@ -1666,7 +1791,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             type: "line",
             data: normData,
             rawValues: raw,
-            unit: "亿份",
+            unit: "亿元",
             isIndex: false,
             group: m.group,
             symbol: "none",
@@ -1708,8 +1833,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         const option = {
           backgroundColor: "transparent",
           title: {
-            text: "主力资金动向：全市场宽基 & ETF份额对比",
-            subtext: `线型区分：虚线=指数走势，实线=ETF份额；所有线条独立配色（当前基准=100 起点：${dates[baseIdx]}）`,
+            text: "主力资金动向：全市场宽基 & ETF规模对比",
+            subtext: `线型区分：虚线=指数走势，实线=ETF规模（亿元）；基准=100 起点：${dates[baseIdx]}`,
             left: "center",
             top: 4,
             textStyle: { color: tc.text, fontSize: 16, fontWeight: 700 },
@@ -1731,7 +1856,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 const sObj = series[p.seriesIndex];
                 const rawVal = sObj && sObj.rawValues ? sObj.rawValues[idx] : "";
                 const rawStr = rawVal != null ? ` <span style="opacity:0.75">(${rawVal.toFixed(2)}${sObj.unit})</span>` : "";
-                const lineTag = sObj && sObj.isIndex ? "[指数·虚]" : "[份额·实]";
+                const lineTag = sObj && sObj.isIndex ? "[指数·虚]" : "[规模·实]";
                 html += `<div style="display:flex;justify-content:space-between;gap:16px;line-height:1.65;">
                   <span>${p.marker} <span style="opacity:0.7;font-size:11px;">${lineTag}</span> ${p.seriesName}</span>
                   <span style="font-family:monospace;font-weight:700;">${p.value.toFixed(2)}${rawStr}</span>
@@ -1840,15 +1965,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         });
       });
 
-      // =========================================================================
-      // SECTION 2: SINGLE BROAD-BASED / SINGLE ETF RESONANCE CHART
-      // =========================================================================
-      const GROUPS = [
-        { group: "科创50", index_code: "sh000688", index_name: "科创50指数", desc: "高弹性科技创新成长赛道" },
-        { group: "沪深300", index_code: "sh000300", index_name: "沪深300指数", desc: "A股核心蓝筹与汇金护盘主力" },
-        { group: "中证1000", index_code: "sh000852", index_name: "中证1000指数", desc: "中小盘高弹性宽基代表" },
-        { group: "中证500", index_code: "sh000905", index_name: "中证500指数", desc: "中盘成长核心宽基代表" },
-        { group: "上证50", index_code: "sh000016", index_name: "上证50指数", desc: "超大盘权重蓝筹风向标" },
+      const GROUPS_RESONANCE = [
+        { group: "科创50", index_code: "sh000688", index_name: "科创50指数" },
+        { group: "沪深300", index_code: "sh000300", index_name: "沪深300指数" },
+        { group: "中证1000", index_code: "sh000852", index_name: "中证1000指数" },
+        { group: "中证500", index_code: "sh000905", index_name: "中证500指数" },
+        { group: "上证50", index_code: "sh000016", index_name: "上证50指数" },
       ];
 
       let activeGroup = "科创50";
@@ -1859,7 +1981,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       function renderStyleTabs() {
         const tabContainer = document.getElementById("styleTabsContainer");
-        tabContainer.innerHTML = GROUPS.map((g) => {
+        tabContainer.innerHTML = GROUPS_RESONANCE.map((g) => {
           const etfs = DATA.etfs_meta.filter((e) => e.group === g.group);
           const names = etfs.map((e) => e.name).join(" / ");
           return `
@@ -1890,7 +2012,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         etfs.forEach((e) => {
           html += `<button class="pill-btn ${activeEtfCode === e.code ? "active" : ""}" data-code="${e.code}">${e.name} (${e.code})</button>`;
         });
-        html += `<button class="pill-btn ${activeEtfCode === "SUM" ? "active" : ""}" data-code="SUM">🔗 ${activeGroup}两只ETF合计份额</button>`;
+        html += `<button class="pill-btn ${activeEtfCode === "SUM" ? "active" : ""}" data-code="SUM">🔗 ${activeGroup}两只ETF合计规模</button>`;
         subContainer.innerHTML = html;
 
         subContainer.querySelectorAll(".pill-btn").forEach((btn) => {
@@ -1903,7 +2025,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
 
       function getResonanceData(groupName, etfCodeOrSum) {
-        const gMeta = GROUPS.find((g) => g.group === groupName);
+        const gMeta = GROUPS_RESONANCE.find((g) => g.group === groupName);
         const idxSeries = DATA.indices_series[gMeta.index_code] || [];
         const etfs = DATA.etfs_meta.filter((e) => e.group === groupName);
 
@@ -1937,17 +2059,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           pctSeries = derived[targetEtf.code].pct;
         }
 
-        return {
-          gMeta,
-          etfs,
-          idxSeries,
-          shareSeries,
-          d1Series,
-          d5Series,
-          pctSeries,
-          titleLabel,
-          threshSingle,
-        };
+        return { gMeta, etfs, idxSeries, shareSeries, d1Series, d5Series, pctSeries, titleLabel, threshSingle };
       }
 
       function buildResonanceOption(groupName, etfCodeOrSum) {
@@ -1959,7 +2071,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           backgroundColor: "transparent",
           title: {
             text: `${groupName} 资金共振总览`,
-            subtext: `${gMeta.index_name}走势 vs ${titleLabel} 份额 & 每日申赎净变化`,
+            subtext: `${gMeta.index_name}走势 vs ${titleLabel} 规模 & 每日规模变化（单位：亿元）`,
             left: "center",
             top: 2,
             textStyle: { color: tc.text, fontSize: 15.5, fontWeight: 700 },
@@ -1991,28 +2103,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   <strong style="font-family:monospace;">${idxVal != null ? idxVal.toFixed(2) : "-"} 点</strong>
                 </div>
                 <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
-                  <span>🏦 ETF总份额：</span>
-                  <strong style="font-family:monospace;">${shVal != null ? shVal.toFixed(2) : "-"} 亿份 (分位 ${pct}%)</strong>
+                  <span>🏦 ETF规模：</span>
+                  <strong style="font-family:monospace;">${shVal != null ? shVal.toFixed(2) : "-"} 亿元 (分位 ${pct}%)</strong>
                 </div>
                 <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
-                  <span>📊 当日份额变化：</span>
-                  <strong style="font-family:monospace;color:${d1Color};">${d1 >= 0 ? "+" : ""}${d1.toFixed(2)} 亿份</strong>
+                  <span>📊 当日规模变化：</span>
+                  <strong style="font-family:monospace;color:${d1Color};">${d1 >= 0 ? "+" : ""}${d1.toFixed(2)} 亿元</strong>
                 </div>
                 <div style="display:flex;justify-content:space-between;gap:18px;line-height:1.7;">
                   <span>🔥 5日累计变化：</span>
-                  <strong style="font-family:monospace;color:${d5Color};">${d5 >= 0 ? "+" : ""}${d5.toFixed(2)} 亿份</strong>
+                  <strong style="font-family:monospace;color:${d5Color};">${d5 >= 0 ? "+" : ""}${d5.toFixed(2)} 亿元</strong>
                 </div>
               `;
             },
           },
-          legend: {
-            top: 48,
-            left: "center",
-            textStyle: { color: tc.text, fontSize: 12 },
-          },
-          axisPointer: {
-            link: [{ xAxisIndex: "all" }],
-          },
+          legend: { top: 48, left: "center", textStyle: { color: tc.text, fontSize: 12 } },
+          axisPointer: { link: [{ xAxisIndex: "all" }] },
           grid: [
             { left: 64, right: 72, top: 86, height: "50%" },
             { left: 64, right: 72, top: "64%", height: "22%" },
@@ -2051,7 +2157,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             },
             {
               type: "value",
-              name: "ETF份额(亿)",
+              name: "ETF规模(亿元)",
               gridIndex: 0,
               scale: true,
               nameTextStyle: { color: tc.subText, fontSize: 11.5 },
@@ -2060,7 +2166,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             },
             {
               type: "value",
-              name: "每日变化(亿)",
+              name: "每日变化(亿元)",
               gridIndex: 1,
               nameTextStyle: { color: tc.subText, fontSize: 11 },
               axisLabel: { color: tc.subText, fontSize: 10.5 },
@@ -2092,7 +2198,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               itemStyle: { color: "#94a3b8" },
             },
             {
-              name: `${titleLabel}份额`,
+              name: `${titleLabel}规模`,
               type: "line",
               xAxisIndex: 0,
               yAxisIndex: 1,
@@ -2131,13 +2237,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         let patternText = "📊 震荡观察期";
         if (+idxChg20 < -1.5 && +shareDiff20 > threshSingle * 0.6) {
-          patternText = "🟢 指数回落 + 份额逆势扩张（典型资金底背离/低位承接）";
+          patternText = "🟢 指数回落 + 规模逆势扩张（典型资金底背离/低位承接）";
         } else if (+idxChg20 > 1.5 && +shareDiff20 > threshSingle * 0.6) {
-          patternText = "🔥 量价齐升（指数与ETF份额同步走强共振）";
+          patternText = "🔥 量价齐升（指数与ETF规模同步走强共振）";
         } else if (+idxChg20 < -1.5 && +shareDiff20 < -threshSingle * 0.6) {
-          patternText = "⚠️ 指数与份额同步回落（资金暂未大规模承接）";
+          patternText = "⚠️ 指数与规模同步回落（资金暂未大规模承接）";
         } else if (+idxChg20 > 2.0 && +shareDiff20 < -threshSingle * 0.6) {
-          patternText = "🔴 指数反弹 + 份额净流出（逢高止盈赎回）";
+          patternText = "🔴 指数反弹 + 规模净流出（逢高止盈赎回）";
         }
 
         const strip = document.getElementById("singleInsightStrip");
@@ -2147,8 +2253,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <span class="insight-val">${titleLabel}</span>
           </div>
           <div class="insight-item">
-            <span class="insight-label">最新ETF份额 / 历史分位</span>
-            <span class="insight-val">${shareSeries[last].toFixed(2)} 亿份 (${pctSeries[last]}%)</span>
+            <span class="insight-label">最新ETF规模 / 历史分位</span>
+            <span class="insight-val">${shareSeries[last].toFixed(2)} 亿元 (${pctSeries[last]}%)</span>
           </div>
           <div class="insight-item">
             <span class="insight-label">最新单日 / 5日累计变化</span>
@@ -2159,7 +2265,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             </span>
           </div>
           <div class="insight-item">
-            <span class="insight-label">近20交易日指数涨跌 / 份额增减</span>
+            <span class="insight-label">近20交易日指数涨跌 / 规模增减</span>
             <span class="insight-val">${idxChg20 >= 0 ? "+" : ""}${idxChg20}% / ${shareDiff20 >= 0 ? "+" : ""}${shareDiff20}亿</span>
           </div>
           <div class="insight-item" style="grid-column: span 2;">
@@ -2177,11 +2283,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         stackedChartInstances.forEach((inst) => inst.dispose());
         stackedChartInstances = [];
 
-        container.innerHTML = GROUPS.map((g, idx) => {
+        container.innerHTML = GROUPS_RESONANCE.map((g, idx) => {
           return `<div class="stacked-chart-item"><div id="stackedChart_${idx}" class="chart-box-single"></div></div>`;
         }).join("");
 
-        GROUPS.forEach((g, idx) => {
+        GROUPS_RESONANCE.forEach((g, idx) => {
           const dom = document.getElementById(`stackedChart_${idx}`);
           const inst = echarts.init(dom);
           const etfs = DATA.etfs_meta.filter((e) => e.group === g.group);
@@ -2235,9 +2341,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       renderSubEtfPills();
       renderSingleInsightAndChart();
 
-      // =========================================================================
-      // THEME & SYNC NOTICE
-      // =========================================================================
       function showToast(msg) {
         const el = document.getElementById("toastMsg");
         el.textContent = msg;
@@ -2275,78 +2378,3 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </script>
 </body>
 </html>
-"""
-
-
-def generate_html(cache: dict) -> str:
-    payload = build_frontend_payload(cache)
-    payload_json = json.dumps(payload, ensure_ascii=False)
-    html_content = HTML_TEMPLATE.replace("__PAYLOAD_JSON__", payload_json)
-    with open(HTML_OUT_PATH, "w", encoding="utf-8") as f:
-        f.write(html_content)
-    print(f"[Build] 已生成交互式网页看板: {HTML_OUT_PATH}")
-    return HTML_OUT_PATH
-
-
-class TrackerRequestHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=BASE_DIR, **kwargs)
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path in ("/", "/index.html"):
-            self.path = "/etf_share_tracker.html"
-        return super().do_GET()
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/sync":
-            try:
-                cache = sync_data(force_full=False)
-                generate_html(cache)
-                body = json.dumps(
-                    {
-                        "ok": True,
-                        "start_date": cache["start_date"],
-                        "end_date": cache["end_date"],
-                        "total_days": cache["total_days"],
-                        "updated_at": cache["updated_at"],
-                    },
-                    ensure_ascii=False,
-                ).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception as e:
-                body = json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False).encode("utf-8")
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            return
-        self.send_response(404)
-        self.end_headers()
-
-
-def main():
-    parser = argparse.ArgumentParser(description="宽基ETF份额追踪与资金底背离监测系统")
-    parser.add_argument("--serve", action="store_true", help="启动本地Web服务器")
-    parser.add_argument("--port", type=int, default=8765, help="本地Web服务器端口 (默认: 8765)")
-    parser.add_argument("--force-full", action="store_true", help="强制重新拉取全量历史数据")
-    args = parser.parse_args()
-
-    cache = sync_data(force_full=args.force_full)
-    generate_html(cache)
-
-    if args.serve:
-        addr = ("127.0.0.1", args.port)
-        httpd = ThreadingHTTPServer(addr, TrackerRequestHandler)
-        print(f"[Server] 本地交互服务已启动: http://127.0.0.1:{args.port}")
-        httpd.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
