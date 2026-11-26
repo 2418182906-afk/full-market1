@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-宽基 ETF 份额追踪 & 资金底背离监测系统
+宽基 ETF 份额追踪 & 资金底背离监测系统 (QTYX V3.6.6 网页复刻增强版)
 数据源：
 1. 五大宽基指数日线：腾讯财经日K接口 (sh000688, sh000852, sh000905, sh000016, sh000300)
 2. 八大核心宽基ETF每日份额：上海证券交易所官方ETF规模接口
@@ -11,6 +11,8 @@
 用法：
 - 更新数据并生成独立HTML看板：
   python3 update_etf_tracker.py
+- 首次更改统计起点后补齐历史区间：
+  python3 update_etf_tracker.py --force-full
 - 启动本地交互Web服务（支持网页端一键同步最新上交所数据）：
   python3 update_etf_tracker.py --serve --port 8765
 """
@@ -33,7 +35,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 CACHE_PATH = os.path.join(DATA_DIR, "etf_share_cache.json")
 HTML_OUT_PATH = os.path.join(BASE_DIR, "etf_share_tracker.html")
 
-START_DATE = "2024-06-03"
+START_DATE = "2024-01-02"
 
 INDICES_META = [
     {"code": "sh000688", "name": "科创50指数", "group": "科创50", "color": "#2b6cb0"},
@@ -190,19 +192,9 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
     b_dates = broad_payload.get("dates") or []
     groups = broad_payload.get("groups") or []
 
-    # 若 broad_market 本身已带 nav_series，则保留
     if broad_payload.get("total_nav_series") and all(g.get("nav_series") for g in groups):
         return broad_payload
 
-    # 收集所有明细 ETF 的代码与交易所
-    all_items = []
-    for g in groups:
-        for det in (g.get("details") or []):
-            c = str(det.get("code") or "").strip()
-            if c:
-                all_items.append((c, str(det.get("exchange") or "")))
-
-    # 补充默认代表 ETF（当 details 缺少历史逐日份额时作为兜底净值参考）
     default_group_nav_codes = {
         "上证50": ("510050", "SH"),
         "沪深300": ("510300", "SH"),
@@ -221,20 +213,19 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
         scale = 10000.0 if mx > 50000 else 1.0
         return [None if v is None else float(v) / scale for v in arr]
 
-    total_shares_norm = normalize_arr(broad_payload.get("total_series") or [])
     total_nav_vals = []
-    group_nav_lookup = {}
 
     for g in groups:
         g_name = g.get("name", "")
-        g_shares_norm = normalize_arr(g.get("series") or [])
         g_details = g.get("details") or []
 
-        # 检查是否存在逐日明细份额序列
-        has_daily_detail_series = any(isinstance(x.get("series"), list) and len(x.get("series")) == len(b_dates) for x in g_details)
+        has_daily_detail_series = any(
+            isinstance(x.get("series"), list) and len(x.get("series")) == len(b_dates)
+            for x in g_details
+        )
 
         g_nav_vals = []
-        fallback_code, fallback_ex = default_group_nav_codes.get(g_name, ("510300", "SH"))
+        fallback_code, _ = default_group_nav_codes.get(g_name, ("510300", "SH"))
         fallback_map = etf_navs.get(fallback_code, {})
 
         for idx, dt in enumerate(b_dates):
@@ -256,7 +247,6 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
             if weighted_denom > 0:
                 g_nav_vals.append(round(weighted_numerator / weighted_denom, 4))
             else:
-                # 退化使用该系列代表ETF当日净值（若当日无净值则向后/向前找最近有效净值）
                 nv = fallback_map.get(dt)
                 if nv is None and fallback_map:
                     prev_dates = [k for k in fallback_map.keys() if k <= dt]
@@ -265,9 +255,7 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
                 g_nav_vals.append(round(float(nv), 4) if nv is not None else None)
 
         g["nav_series"] = g_nav_vals
-        group_nav_lookup[g_name] = g_nav_vals
 
-    # 计算七大系列合计每日加权净值 = sum(各系列份额 * 各系列净值) / sum(各系列份额)
     for idx, dt in enumerate(b_dates):
         num = 0.0
         den = 0.0
@@ -281,7 +269,6 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
         if den > 0:
             total_nav_vals.append(round(num / den, 4))
         else:
-            # 兜底用沪深300ETF净值
             nv_300 = etf_navs.get("510300", {}).get(dt)
             total_nav_vals.append(round(float(nv_300), 4) if nv_300 is not None else None)
 
@@ -317,7 +304,7 @@ def sync_data(force_full: bool = False) -> dict:
             if d[0] >= START_DATE:
                 series[d[0]] = round(float(d[2]), 2)
                 all_dates_set.add(d[0])
-        indices_data[code] = series
+        indices_data[code] = {k: v for k, v in series.items() if k >= START_DATE}
 
     all_trading_dates = sorted(list(all_dates_set))
     target_codes = {e["code"] for e in ETFS_META}
@@ -362,7 +349,7 @@ def sync_data(force_full: bool = False) -> dict:
                 if res:
                     etf_by_date[d] = res
 
-    valid_dates = sorted([d for d in etf_by_date.keys() if etf_by_date[d]])
+    valid_dates = sorted([d for d in etf_by_date.keys() if etf_by_date[d] and d >= START_DATE])
 
     broad_cache = sync_broad_market(force_full=force_full)
     broad_payload = build_broad_payload(broad_cache)
