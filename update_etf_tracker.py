@@ -18,9 +18,7 @@
 """
 
 import argparse
-import csv
 import json
-import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -155,193 +153,6 @@ ETFS_META = [
 ]
 
 
-# =============================================================================
-# 轻量份额复权、向后对齐、申赎汇总与异常排查（纯标准库，无 numpy/pandas 依赖）
-# =============================================================================
-SHARE_EVENT_TYPES = {"split", "merge", "dividend_reinvest"}
-ALL_EVENT_TYPES = SHARE_EVENT_TYPES | {"dividend_cash"}
-
-
-def _percentile(values: list[float], q: float) -> float:
-    if not values:
-        return math.inf
-    s = sorted(values)
-    idx = (len(s) - 1) * q
-    lo = int(math.floor(idx))
-    hi = int(math.ceil(idx))
-    if lo == hi:
-        return s[lo]
-    return s[lo] + (s[hi] - s[lo]) * (idx - lo)
-
-
-def compute_etf_flows_and_audit(
-    share_rows: list[dict],
-    nav_rows: list[dict],
-    event_rows: list[dict] | None = None,
-    trading_dates: list[str] | None = None,
-    share_unit: str = "yi",
-) -> tuple[list[dict], list[dict], list[dict]]:
-    unit_scale = {"fen": 1.0, "wan": 1e4, "yi": 1e8}
-    assert share_unit in unit_scale, f"不支持的 share_unit: {share_unit}"
-    scale_to_yi = unit_scale[share_unit] / 1e8
-
-    share_map: dict[tuple[str, str], float] = {}
-    nav_map: dict[tuple[str, str], float] = {}
-    funds_set: set[str] = set()
-    dates_set: set[str] = set(trading_dates or [])
-
-    for r in share_rows:
-        dt = str(r["trade_date"])
-        fc = str(r["fund_code"]).strip()
-        key = (dt, fc)
-        assert key not in share_map, f"share 存在重复键: {key}"
-        share_map[key] = float(r["total_share"])
-        funds_set.add(fc)
-        dates_set.add(dt)
-
-    for r in nav_rows:
-        dt = str(r["trade_date"])
-        fc = str(r["fund_code"]).strip()
-        key = (dt, fc)
-        assert key not in nav_map, f"nav 存在重复键: {key}"
-        nav_map[key] = float(r["unit_nav"])
-        funds_set.add(fc)
-        dates_set.add(dt)
-
-    cash_set: set[tuple[str, str]] = set()
-    share_ev_by_fund: dict[str, list[tuple[str, float]]] = {}
-    if event_rows:
-        for ev in event_rows:
-            fc = str(ev["fund_code"]).strip()
-            ex_dt = str(ev["ex_date"])
-            et = str(ev["event_type"]).strip()
-            assert et in ALL_EVENT_TYPES, f"非法 event_type: {et}"
-            if et == "dividend_cash":
-                cash_set.add((ex_dt, fc))
-            else:
-                ratio = float(ev["ratio"])
-                assert ratio > 0, f"份额事件 ratio 必须大于 0: {ev}"
-                share_ev_by_fund.setdefault(fc, []).append((ex_dt, ratio))
-
-    cum_factor_by_fund_date: dict[str, list[tuple[str, float]]] = {}
-    for fc, ev_list in share_ev_by_fund.items():
-        ev_list.sort(key=lambda x: x[0])
-        by_date: dict[str, float] = {}
-        acc = 1.0
-        for ex_dt, ratio in ev_list:
-            acc *= ratio
-            by_date[ex_dt] = acc
-        cum_factor_by_fund_date[fc] = sorted(by_date.items(), key=lambda x: x[0])
-
-    cal_dates = sorted(dates_set)
-    funds = sorted(funds_set)
-
-    detail: list[dict] = []
-    seen_out_keys: set[tuple[str, str]] = set()
-
-    for fc in funds:
-        s_hist: list[tuple[str, float]] = []
-        n_hist: list[tuple[str, float]] = []
-        ev_hist = cum_factor_by_fund_date.get(fc, [])
-        ev_ptr = 0
-        cur_factor = 1.0
-
-        s_idx = 0
-        n_idx = 0
-        prev_adj_share: float | None = None
-
-        fc_s_dates = sorted(dt for (dt, c), v in share_map.items() if c == fc and v is not None)
-        fc_n_dates = sorted(dt for (dt, c), v in nav_map.items() if c == fc and v is not None)
-
-        for dt in cal_dates:
-            while s_idx < len(fc_s_dates) and fc_s_dates[s_idx] <= dt:
-                d_s = fc_s_dates[s_idx]
-                s_hist.append((d_s, share_map[(d_s, fc)]))
-                s_idx += 1
-
-            while n_idx < len(fc_n_dates) and fc_n_dates[n_idx] <= dt:
-                d_n = fc_n_dates[n_idx]
-                n_hist.append((d_n, nav_map[(d_n, fc)]))
-                n_idx += 1
-
-            while ev_ptr < len(ev_hist) and ev_hist[ev_ptr][0] <= dt:
-                cur_factor = ev_hist[ev_ptr][1]
-                ev_ptr += 1
-
-            if not s_hist or not n_hist:
-                continue
-
-            share_date, total_share = s_hist[-1]
-            nav_date, unit_nav = n_hist[-1]
-            assert share_date == nav_date, f"{fc} 在 {dt} 对齐后 share_date({share_date}) != nav_date({nav_date})"
-
-            adj_share = total_share * cur_factor
-            assert adj_share >= 0, f"{fc} 在 {dt} 还原份额为负: {adj_share}"
-
-            out_key = (dt, fc)
-            assert out_key not in seen_out_keys, f"输出存在重复键: {out_key}"
-            seen_out_keys.add(out_key)
-
-            share_t = adj_share
-            share_t1 = prev_adj_share
-            delta_share = (share_t - share_t1) if share_t1 is not None else None
-            amount_yi = (delta_share * unit_nav * scale_to_yi) if delta_share is not None else None
-
-            detail.append({
-                "trade_date": dt,
-                "fund_code": fc,
-                "share_date": share_date,
-                "nav_date": nav_date,
-                "total_share": round(total_share, 6),
-                "adj_factor": round(cur_factor, 8),
-                "adj_share": round(adj_share, 6),
-                "share_T": round(share_t, 6),
-                "share_T1": round(share_t1, 6) if share_t1 is not None else None,
-                "delta_share": round(delta_share, 6) if delta_share is not None else None,
-                "unit_nav": round(unit_nav, 6),
-                "amount_yi": round(amount_yi, 6) if amount_yi is not None else None,
-                "is_cash_div": (dt, fc) in cash_set,
-            })
-            prev_adj_share = adj_share
-
-    sum_by_date: dict[str, float] = {}
-    for row in detail:
-        if row["amount_yi"] is not None:
-            dt = row["trade_date"]
-            sum_by_date[dt] = sum_by_date.get(dt, 0.0) + row["amount_yi"]
-
-    summary = [
-        {"trade_date": dt, "sum_amount_yi": round(sum_by_date[dt], 6)}
-        for dt in sorted(sum_by_date.keys())
-    ]
-
-    abs_by_fund: dict[str, list[float]] = {}
-    for row in detail:
-        if row["delta_share"] is not None:
-            abs_by_fund.setdefault(row["fund_code"], []).append(abs(row["delta_share"]))
-    p99_by_fund = {fc: _percentile(vals, 0.99) for fc, vals in abs_by_fund.items()}
-
-    anomalies: list[dict] = []
-    for row in detail:
-        ds = row["delta_share"]
-        if ds is not None and abs(ds) > p99_by_fund.get(row["fund_code"], math.inf):
-            anomalies.append({
-                **row,
-                "p99_thresh": round(p99_by_fund[row["fund_code"]], 6),
-                "anomaly_reason": "abs(delta_share) > fund_99th_percentile",
-            })
-
-    return detail, summary, anomalies
-
-
-def _write_csv(path: str, rows: list[dict], fieldnames: list[str]) -> None:
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow({k: r.get(k, "") for k in fieldnames})
-
-
 def _to_tx_symbol(code: str, exchange: str = "") -> str:
     c = str(code).strip()
     ex = str(exchange).upper()
@@ -353,6 +164,7 @@ def _to_tx_symbol(code: str, exchange: str = "") -> str:
 
 
 def fetch_etf_daily_navs(codes_with_ex: list, existing_navs: dict, session: requests.Session) -> dict:
+    """拉取宽基ETF每日净值/收盘价序列（用于 净份额 × 每日净值 换算亿元）"""
     nav_map = {k: dict(v) for k, v in (existing_navs or {}).items()}
     for code, ex in codes_with_ex:
         sym = _to_tx_symbol(code, ex)
@@ -373,6 +185,7 @@ def fetch_etf_daily_navs(codes_with_ex: list, existing_navs: dict, session: requ
 
 
 def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
+    """为 broad_market 各系列及七大系列合计计算每日净值序列（nav_series）"""
     if not broad_payload or not broad_payload.get("groups"):
         return broad_payload
 
@@ -400,13 +213,17 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
         scale = 10000.0 if mx > 50000 else 1.0
         return [None if v is None else float(v) / scale for v in arr]
 
+    total_nav_vals = []
+
     for g in groups:
         g_name = g.get("name", "")
         g_details = g.get("details") or []
+
         has_daily_detail_series = any(
             isinstance(x.get("series"), list) and len(x.get("series")) == len(b_dates)
             for x in g_details
         )
+
         g_nav_vals = []
         fallback_code, _ = default_group_nav_codes.get(g_name, ("510300", "SH"))
         fallback_map = etf_navs.get(fallback_code, {})
@@ -414,6 +231,7 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
         for idx, dt in enumerate(b_dates):
             weighted_numerator = 0.0
             weighted_denom = 0.0
+
             if has_daily_detail_series:
                 for det in g_details:
                     c = str(det.get("code") or "").strip()
@@ -425,6 +243,7 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
                         if nv is not None and float(nv) > 0:
                             weighted_numerator += sh_yi * float(nv)
                             weighted_denom += sh_yi
+
             if weighted_denom > 0:
                 g_nav_vals.append(round(weighted_numerator / weighted_denom, 4))
             else:
@@ -434,9 +253,9 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
                     if prev_dates:
                         nv = fallback_map[max(prev_dates)]
                 g_nav_vals.append(round(float(nv), 4) if nv is not None else None)
+
         g["nav_series"] = g_nav_vals
 
-    total_nav_vals = []
     for idx, dt in enumerate(b_dates):
         num = 0.0
         den = 0.0
@@ -458,6 +277,7 @@ def attach_series_nav(broad_payload: dict, etf_navs: dict) -> dict:
 
 
 def sync_data(force_full: bool = False) -> dict:
+    """增量同步五大宽基指数日线与上交所8只宽基ETF份额数据"""
     os.makedirs(DATA_DIR, exist_ok=True)
     cache = {}
     if os.path.exists(CACHE_PATH) and not force_full:
@@ -488,6 +308,7 @@ def sync_data(force_full: bool = False) -> dict:
 
     all_trading_dates = sorted(list(all_dates_set))
     target_codes = {e["code"] for e in ETFS_META}
+
     recent_recheck = set(all_trading_dates[-3:]) if all_trading_dates else set()
     missing_dates = [
         d for d in all_trading_dates
@@ -550,31 +371,6 @@ def sync_data(force_full: bool = False) -> dict:
     etf_navs = fetch_etf_daily_navs(nav_targets, etf_navs, session)
     broad_payload = attach_series_nav(broad_payload, etf_navs)
 
-    share_rows, nav_rows = [], []
-    for d in valid_dates:
-        for c, sh in etf_by_date.get(d, {}).items():
-            if sh is not None:
-                share_rows.append({"trade_date": d, "fund_code": c, "total_share": sh})
-                nv = etf_navs.get(c, {}).get(d)
-                if nv is not None:
-                    nav_rows.append({"trade_date": d, "fund_code": c, "unit_nav": nv})
-    if share_rows and nav_rows:
-        detail_rows, summary_rows, anomaly_rows = compute_etf_flows_and_audit(
-            share_rows=share_rows,
-            nav_rows=nav_rows,
-            event_rows=None,
-            trading_dates=valid_dates,
-            share_unit="yi",
-        )
-        detail_cols = [
-            "trade_date", "fund_code", "share_date", "nav_date",
-            "total_share", "adj_factor", "adj_share", "share_T", "share_T1",
-            "delta_share", "unit_nav", "amount_yi", "is_cash_div",
-        ]
-        _write_csv(os.path.join(DATA_DIR, "etf_flow_detail.csv"), detail_rows, detail_cols)
-        _write_csv(os.path.join(DATA_DIR, "etf_flow_summary.csv"), summary_rows, ["trade_date", "sum_amount_yi"])
-        _write_csv(os.path.join(DATA_DIR, "etf_flow_anomalies.csv"), anomaly_rows, detail_cols + ["p99_thresh", "anomaly_reason"])
-
     new_cache = {
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "start_date": valid_dates[0] if valid_dates else START_DATE,
@@ -600,12 +396,14 @@ def sync_data(force_full: bool = False) -> dict:
 
 
 def build_frontend_payload(cache: dict) -> dict:
+    """将缓存数据整理为前端高密度列式JSON结构"""
     dates = cache["dates"]
     indices_series = {}
     for idx_meta in INDICES_META:
         c = idx_meta["code"]
         raw_map = cache["indices_data"].get(c, {})
-        vals, last_val = [], None
+        vals = []
+        last_val = None
         for d in dates:
             v = raw_map.get(d, last_val)
             if v is not None:
@@ -616,9 +414,11 @@ def build_frontend_payload(cache: dict) -> dict:
     etf_series = {}
     for etf_meta in ETFS_META:
         c = etf_meta["code"]
-        vals, last_val = [], None
+        vals = []
+        last_val = None
         for d in dates:
-            v = cache["etf_by_date"].get(d, {}).get(c, last_val)
+            day_map = cache["etf_by_date"].get(d, {})
+            v = day_map.get(c, last_val)
             if v is not None:
                 last_val = v
             vals.append(round(v, 4) if v is not None else None)
@@ -718,6 +518,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       transition: background-color 0.2s ease, color 0.2s ease;
     }
 
+    /* Top Navigation / Header */
     .top-header {
       background: var(--bg-card);
       border-bottom: 1px solid var(--border-color);
@@ -828,6 +629,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       padding: 18px 24px 0;
     }
 
+    /* Guide / Risk Banner */
     .guide-banner {
       background: var(--bg-card);
       border: 1px solid var(--border-color);
@@ -869,6 +671,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-weight: 600;
     }
 
+    /* 8 ETF Snapshot Cards */
     .etf-grid {
       display: grid;
       grid-template-columns: repeat(8, 1fr);
@@ -972,6 +775,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       color: var(--text-muted);
     }
 
+    /* Section Card */
     .section-card {
       background: var(--bg-card);
       border: 1px solid var(--border-color);
@@ -1015,6 +819,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       color: var(--text-muted);
     }
 
+    /* Filter Pills & Toolbar */
     .toolbar-row {
       display: flex;
       flex-wrap: wrap;
@@ -1071,6 +876,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       border: 1px solid var(--border-color);
     }
 
+    /* Chart containers */
     .chart-box-overview {
       width: 100%;
       height: 580px;
@@ -1091,6 +897,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       background: var(--bg-subtle);
     }
 
+    /* Style Selector Tabs */
     .style-tabs {
       display: flex;
       flex-wrap: wrap;
@@ -1121,6 +928,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       box-shadow: 0 2px 8px rgba(29, 78, 216, 0.25);
     }
 
+    /* Single ETF Insight Bar */
     .insight-strip {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -1158,6 +966,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-weight: 700;
     }
 
+    /* Full-market broad ETF aggregation panel */
     .broad-market-panel {
       background: var(--bg-card);
       border: 1px solid var(--border-color);
@@ -1291,6 +1100,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </style>
 </head>
 <body>
+  <!-- Sticky Top Navigation -->
   <header class="top-header">
     <div class="header-inner">
       <div class="brand-group">
@@ -1315,6 +1125,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   </header>
 
   <main class="container">
+    <!-- Reading Guide & Risk Reminder -->
     <div class="guide-banner">
       <div class="guide-rules">
         <span class="rule-pill">📏 <strong>看图统一规则</strong>：虚线 = 宽基指数走势，实线 = ETF 份额（起点归一到 100）</span>
@@ -1324,6 +1135,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="guide-warn">⚠️ 提示：资金底先行 ≠ 价格底立刻到来，二者常有磨底时间差，仅供宏观观测辅助</div>
     </div>
 
+    <!-- 1. 原来的“沪深两市宽基 ETF 全系列份额汇总”图（多线对比 + 每日份额变化） -->
     <section class="broad-market-panel" id="sec-broad-market">
       <div class="broad-market-head">
         <div>
@@ -1337,6 +1149,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div id="broadMarketChart" style="height:460px;width:100%;"></div>
 
+      <!-- 换算成“亿元”为单位（净份额 × 每日净值）的一模一样样式“沪深两市宽基 ETF 全系列份额汇总”图 -->
       <div class="section-header" style="margin-top:20px;margin-bottom:12px;padding-bottom:10px;">
         <div class="section-title-group">
           <div class="section-title" style="font-size:15.5px;">
@@ -1366,6 +1179,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="broad-status" id="broadMarketStatus"></div>
     </section>
 
+    <!-- 2. 新增的独立系列图板块（单独查看某一个系列的总份额与每日份额变化） -->
     <section class="section-card" id="sec-single-series">
       <div class="section-header">
         <div class="section-title-group">
@@ -1395,6 +1209,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div id="singleSeriesChart" style="height:440px;width:100%;"></div>
 
+      <!-- 换算成“亿元”为单位（净份额 × 每日净值）的一模一样样式“单系列 ETF 份额独立观测图” -->
       <div class="section-header" style="margin-top:20px;margin-bottom:12px;padding-bottom:10px;">
         <div class="section-title-group">
           <div class="section-title" style="font-size:15.5px;">
@@ -1408,8 +1223,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="singleSeriesChartYiYuan" style="height:440px;width:100%;"></div>
     </section>
 
+    <!-- 8 Core Broad-Based ETF Snapshot Cards -->
     <section class="etf-grid" id="etfSnapshotGrid"></section>
 
+    <!-- 3. All-Market Normalized Comparison Chart -->
     <section class="section-card" id="sec-overview">
       <div class="section-header">
         <div class="section-title-group">
@@ -1450,6 +1267,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="chartOverview" class="chart-box-overview"></div>
     </section>
 
+    <!-- 4. Single Broad-Based / Single ETF Resonance Chart -->
     <section class="section-card" id="sec-single">
       <div class="section-header">
         <div class="section-title-group">
@@ -1473,8 +1291,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       <div class="insight-strip" id="singleInsightStrip"></div>
 
+      <!-- Tab view container -->
       <div id="chartSingle" class="chart-box-single"></div>
 
+      <!-- Stacked all-5-groups view container (hidden by default) -->
       <div id="stackedChartsContainer" class="stacked-charts-grid" style="display: none;"></div>
     </section>
   </main>
@@ -1815,6 +1635,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         };
       }
 
+      // =========================================================================
+      // 1. 原来的“沪深两市宽基 ETF 全系列份额汇总”图 + 新增“亿元”换算同款图（净份额 × 每日净值）
+      // =========================================================================
       let broadChartInstance = null;
       let broadChartYiYuanInstance = null;
       let singleSeriesChartInstance = null;
@@ -1991,6 +1814,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           ((B.errors || []).length ? ` 采集异常 ${B.errors.length} 项；缺失数据不以前值填充。` : "");
       }
 
+      // =========================================================================
+      // 2. 新增的独立系列图板块 + 新增“亿元”换算同款图（净份额 × 每日净值）
+      // =========================================================================
       function renderSingleSeriesSection() {
         const B = DATA.broad_market || {};
         const groups = B.groups || [];
@@ -2181,6 +2007,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       renderBroadMarket();
       renderSingleSeriesSection();
 
+      // =========================================================================
+      // DERIVED METRICS FOR 8 CORE ETFS
+      // =========================================================================
       const derived = {};
       function computeDerived() {
         DATA.etfs_meta.forEach((m) => {
@@ -2279,6 +2108,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
       renderSnapshotCards();
 
+      // =========================================================================
+      // 3. ALL-MARKET NORMALIZED OVERVIEW CHART
+      // =========================================================================
       const chartOverview = echarts.init(document.getElementById("chartOverview"));
       let overviewZoomStart = 0;
       let overviewZoomEnd = 100;
@@ -2488,6 +2320,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         });
       });
 
+      // =========================================================================
+      // 4. SINGLE BROAD-BASED / SINGLE ETF RESONANCE CHART
+      // =========================================================================
       const GROUPS = [
         { group: "科创50", index_code: "sh000688", index_name: "科创50指数", desc: "高弹性科技创新成长赛道" },
         { group: "沪深300", index_code: "sh000300", index_name: "沪深300指数", desc: "A股核心蓝筹与汇金护盘主力" },
@@ -2880,6 +2715,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       renderSubEtfPills();
       renderSingleInsightAndChart();
 
+      // =========================================================================
+      // THEME & SYNC NOTICE
+      // =========================================================================
       function showToast(msg) {
         const el = document.getElementById("toastMsg");
         el.textContent = msg;
